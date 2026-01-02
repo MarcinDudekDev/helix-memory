@@ -1,0 +1,214 @@
+#!/bin/bash
+# memory - Helix Memory CLI wrapper
+# Usage: memory <command> [args]
+#
+# Commands:
+#   start               Start HelixDB (auto-starts Docker Desktop if needed)
+#   stop                Stop HelixDB
+#   restart             Restart HelixDB
+#   status              Check HelixDB status
+#   search <query>      Search memories by content
+#   list [--limit N]    List all memories
+#   store <content>     Store a new memory
+#   delete <id>         Delete memory by ID (supports prefix)
+#   tag <tag>           Find memories by tag
+#   recall <topic>      Alias for search (natural language)
+#   remember <content>  Quick store with auto-categorization
+#   project-log         Technical project/task log (opposite of devlog)
+#   show <id>           Show memory details by ID
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+HELPER="$SCRIPT_DIR/scripts/memory_helper.py"
+HELIX_BIN="${HELIX_BIN:-$(which helix 2>/dev/null || echo "$HOME/.local/bin/helix")}"
+
+# Function to check if Docker is running
+docker_running() {
+    docker info &>/dev/null
+}
+
+# Function to start Docker Desktop if not running
+ensure_docker() {
+    if docker_running; then
+        return 0
+    fi
+
+    echo "Docker not running. Starting Docker Desktop..."
+    open -a "Docker Desktop"
+
+    # Wait for Docker to start (max 60 seconds)
+    local attempts=0
+    while ! docker_running; do
+        if [ $attempts -ge 30 ]; then
+            echo "ERROR: Docker Desktop failed to start within 60 seconds"
+            return 1
+        fi
+        sleep 2
+        attempts=$((attempts + 1))
+        printf "."
+    done
+    echo " Docker ready!"
+    return 0
+}
+
+# Function to check if HelixDB is running
+helix_running() {
+    curl -s --connect-timeout 2 "http://localhost:6969/GetAllMemories" -X POST -H "Content-Type: application/json" -d '{}' &>/dev/null
+}
+
+case "$1" in
+    start)
+        if helix_running; then
+            echo "HelixDB already running"
+            python3 "$HELPER" status
+            exit 0
+        fi
+
+        ensure_docker || exit 1
+
+        echo "Starting HelixDB..."
+        cd "$SCRIPT_DIR" && "$HELIX_BIN" push dev
+
+        # Wait for helix to be ready
+        sleep 2
+        if helix_running; then
+            echo "HelixDB started successfully"
+            python3 "$HELPER" status
+        else
+            echo "HelixDB may still be starting... check 'memory status' in a moment"
+        fi
+        ;;
+    stop)
+        if ! helix_running; then
+            echo "HelixDB is not running"
+            exit 0
+        fi
+
+        echo "Stopping HelixDB..."
+        cd "$SCRIPT_DIR" && "$HELIX_BIN" stop dev
+        echo "HelixDB stopped"
+        ;;
+    restart)
+        $0 stop
+        sleep 2
+        $0 start
+        ;;
+    status|st)
+        python3 "$HELPER" status
+        ;;
+    search|s)
+        shift
+        python3 "$HELPER" search "$@"
+        ;;
+    list|ls)
+        shift
+        python3 "$HELPER" list "$@"
+        ;;
+    store)
+        shift
+        if [ -z "$1" ]; then
+            echo "Usage: memory store <content> [-t category] [-i importance] [-g tags]"
+            exit 1
+        fi
+        # If first arg is -c or --content, pass through as-is (user provided flag)
+        # Otherwise, add -c prefix for positional content
+        if [[ "$1" == "-c" || "$1" == "--content" ]]; then
+            python3 "$HELPER" store "$@"
+        else
+            python3 "$HELPER" store -c "$@"
+        fi
+        ;;
+    delete|del|rm)
+        shift
+        if [ -z "$1" ]; then
+            echo "Usage: memory delete <memory-id>"
+            exit 1
+        fi
+        python3 "$HELPER" delete "$1"
+        ;;
+    tag|by-tag)
+        shift
+        python3 "$HELPER" by-tag "$1"
+        ;;
+    recall|r)
+        shift
+        python3 "$HELPER" search "$*"
+        ;;
+    project-log|plog)
+        shift
+        python3 "$SCRIPT_DIR/project_log.py" "$@"
+        ;;
+    show)
+        shift
+        if [ -z "$1" ]; then
+            echo "Usage: memory show <memory-id>"
+            exit 1
+        fi
+        python3 "$HELPER" search "$1"
+        ;;
+    remember|rem)
+        shift
+        content="$*"
+        if [ -z "$content" ]; then
+            echo "Usage: memory remember <what to remember>"
+            exit 1
+        fi
+        echo "Analyzing memory (using Ollama if available, Haiku fallback)..."
+        json=$(python3 "$HELPER" categorize "$content" 2>/dev/null)
+        if [ -n "$json" ]; then
+            category=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('category','fact'))" 2>/dev/null || echo "fact")
+            importance=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('importance',5))" 2>/dev/null || echo "5")
+            tags=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tags',''))" 2>/dev/null || echo "")
+            python3 "$HELPER" store -c "$content" -t "$category" -i "$importance" -g "$tags" --force
+        else
+            python3 "$HELPER" store -c "$content" -t fact -i 5 --force
+        fi
+        ;;
+    help|--help|-h)
+        cat << 'EOF'
+Helix Memory CLI
+
+Usage: memory <command> [args]
+
+Service Commands:
+  start                   Start HelixDB (auto-starts Docker Desktop if needed)
+  stop                    Stop HelixDB
+  restart                 Restart HelixDB
+  status, st              Check HelixDB status and memory count
+
+Memory Commands:
+  search, s <query>       Search memories by content
+  list, ls [--limit N]    List all memories (sorted by importance)
+  store <content>         Store memory (-t category -i importance -g tags)
+  delete, rm <id>         Delete memory by ID (prefix matching OK)
+  tag <tag>               Find memories by tag
+  recall, r <topic>       Search memories (alias)
+  remember, rem <text>    Quick store with auto-categorization
+  show <id>               Show memory details by ID
+
+Reports:
+  project-log, plog       Technical project/task log
+    --date YYYY-MM-DD     Specific date
+    --month YYYY-MM       Full month summary
+    --project NAME        Filter by project
+    --days N              Look back N days
+
+Examples:
+  memory start            # Start HelixDB (starts Docker if needed)
+  memory stop             # Stop HelixDB
+  memory status
+  memory search "pytest"
+  memory list --limit 10
+  memory remember "User prefers FastAPI over Flask"
+  memory delete abc123
+
+Categories: preference, fact, context, decision, task, solution
+EOF
+        ;;
+    "")
+        python3 "$HELPER" status
+        ;;
+    *)
+        # Default: treat as search query (backward compatible)
+        python3 "$HELPER" search "$*"
+        ;;
+esac

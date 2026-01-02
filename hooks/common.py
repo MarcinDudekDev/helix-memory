@@ -1,0 +1,1367 @@
+#!/usr/bin/env python3
+"""
+Common utilities for HelixDB memory hooks.
+Enhanced with real embeddings, time-windows, and reasoning chains.
+"""
+
+import json
+import os
+import requests
+from typing import List, Dict, Any, Optional, Tuple
+from pathlib import Path
+from datetime import datetime, timedelta
+import sys
+
+# HelixDB configuration
+HELIX_URL = "http://localhost:6969"
+
+# Embedding configuration
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_EMBEDDING_MODEL = "text-embedding-004"  # 768 dims, free tier
+GEMINI_LLM_MODEL = "gemma-3-4b-it"  # 30 RPM, 14.4K RPD - instruction-tuned, high free limits
+EMBEDDING_DIM = 1536  # HelixDB was initialized with 1536 (OpenAI standard) - must match
+
+# Ollama config (for embeddings and LLM)
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "nomic-embed-text"  # For embeddings
+OLLAMA_LLM_MODEL = os.environ.get("OLLAMA_LLM_MODEL", "llama3.2:3b")  # For text generation
+
+# LLM provider preference: "ollama" (free, local) or "haiku" (Claude API)
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")  # Default to Ollama when available
+
+# Time windows (in hours)
+TIME_WINDOWS = {
+    "recent": 4,       # Last 4 hours - immediate context
+    "contextual": 720, # Last 30 days - balanced
+    "deep": 2160,      # Last 90 days - thorough
+    "full": None       # All time
+}
+
+# Embedding cache (LRU-style, persisted per-process)
+_embedding_cache: Dict[str, Tuple[List[float], str]] = {}
+_CACHE_MAX_SIZE = 500  # Max cached embeddings
+
+# ============================================================================
+# BASIC I/O
+# ============================================================================
+
+def read_hook_input() -> Dict[str, Any]:
+    """Read hook input JSON from stdin."""
+    try:
+        return json.loads(sys.stdin.read())
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Failed to parse hook input: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def parse_transcript(transcript_path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Parse conversation transcript from JSONL file."""
+    transcript = []
+    try:
+        with open(transcript_path, 'r') as f:
+            for line in f:
+                if line.strip():
+                    entry = json.loads(line)
+                    if entry.get("type") in ["user", "assistant"]:
+                        transcript.append(entry)
+    except FileNotFoundError:
+        print(f"WARNING: Transcript file not found: {transcript_path}", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"ERROR: Failed to parse transcript: {e}", file=sys.stderr)
+        return []
+
+    if limit and len(transcript) > limit:
+        return transcript[-limit:]
+    return transcript
+
+def extract_message_content(message: Dict[str, Any]) -> str:
+    """Extract text content from a message."""
+    content = message.get("message", {}).get("content", "")
+    if isinstance(content, str):
+        return content
+    elif isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                texts.append(block)
+        return "\n".join(texts)
+    return str(content)
+
+# ============================================================================
+# PROJECT DETECTION
+# ============================================================================
+
+_known_projects_cache = None
+
+def get_known_projects() -> Dict[str, str]:
+    """Get known projects from p tool (cached)."""
+    global _known_projects_cache
+    if _known_projects_cache is not None:
+        return _known_projects_cache
+
+    import subprocess
+    projects = {}
+    try:
+        result = subprocess.run(
+            [str(Path.home() / 'Tools' / 'p'), '--list'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if ':' in line:
+                    name, path = line.split(':', 1)
+                    name = name.strip()
+                    path = path.strip()
+                    if name and path:
+                        projects[path] = name
+    except Exception as e:
+        print(f"WARNING: Could not get projects from p tool: {e}", file=sys.stderr)
+
+    _known_projects_cache = projects
+    return projects
+
+
+def detect_project(cwd: str) -> str:
+    """
+    Detect project name from working directory.
+    Priority:
+    1. Exact match in p tool registry
+    2. Directory name-based detection (most reliable)
+    3. Prefix match in registry (least specific)
+    """
+    if not cwd:
+        return ""
+
+    cwd = cwd.rstrip('/')
+    projects = get_known_projects()
+
+    # Priority 1: Exact match or DIRECT child in registry
+    # Only use registry if cwd IS the project or is immediately inside it
+    for path, name in projects.items():
+        path = path.rstrip('/')
+        if cwd == path:
+            return name.lower().replace(' ', '-')
+        # Check if cwd is direct child or very close (max 2 levels deep)
+        if cwd.startswith(path + '/'):
+            relative = cwd[len(path)+1:]
+            depth = len(relative.split('/'))
+            if depth <= 2 and len(path.split('/')) > 4:  # Deep project, close match
+                return name.lower().replace(' ', '-')
+
+    # Priority 2: Extract from path (most reliable for unregistered projects)
+    SKIP_DIRS = {'wordpress', 'wp-content', 'plugins', 'themes', 'Sites',
+                 'Tools', 'Projects', 'PycharmProjects', 'Documents', 'Praca',
+                 'Users', 'cminds', 'hooks', 'src', 'lib', 'node_modules',
+                 '.wp-test', 'sites', 'Fiverr', '_WLASNE_'}
+
+    parts = cwd.split('/')
+    for part in reversed(parts):
+        if part and len(part) > 2 and part not in SKIP_DIRS:
+            # Clean up common suffixes
+            result = part.lower().replace(' ', '-')
+            result = result.replace('.local', '').replace('.loc', '')
+            # Normalize known project aliases
+            if result in ('marriagemarketal', 'marriagemarket'):
+                return 'marriagemarket'
+            return result
+
+    # Priority 3: Fallback to longest prefix match
+    best_match = ""
+    best_name = ""
+    for path, name in projects.items():
+        path = path.rstrip('/')
+        if cwd.startswith(path):
+            if len(path) > len(best_match):
+                best_match = path
+                best_name = name
+
+    if best_name:
+        return best_name.lower().replace(' ', '-')
+
+    return ""
+
+# ============================================================================
+# HELIX CONNECTION
+# ============================================================================
+
+def check_helix_running() -> bool:
+    """Check if HelixDB is accessible."""
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetAllMemories",
+            json={},
+            headers={"Content-Type": "application/json"},
+            timeout=2
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+def try_restart_helix() -> bool:
+    """Attempt to restart HelixDB if it's not running."""
+    import subprocess
+    print("INFO: Attempting to restart HelixDB...", file=sys.stderr)
+    try:
+        result = subprocess.run(
+            ["/Users/cminds/.local/bin/helix", "start", "dev"],
+            cwd="/Users/cminds/Tools/helix-memory",
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            import time
+            time.sleep(3)
+            if check_helix_running():
+                print("SUCCESS: HelixDB restarted successfully", file=sys.stderr)
+                return True
+        return False
+    except Exception as e:
+        print(f"WARNING: Error restarting HelixDB: {e}", file=sys.stderr)
+        return False
+
+def ensure_helix_running() -> bool:
+    """Ensure HelixDB is running, attempting restart if needed."""
+    if check_helix_running():
+        return True
+    if try_restart_helix():
+        return True
+    print("⚠️  ALERT: HelixDB not running and auto-restart failed", file=sys.stderr)
+    return False
+
+# ============================================================================
+# EMBEDDINGS (Real vectors!)
+# ============================================================================
+
+def pad_embedding(embedding: List[float], target_dim: int = EMBEDDING_DIM) -> List[float]:
+    """Pad embedding to target dimension with zeros."""
+    if len(embedding) >= target_dim:
+        return embedding[:target_dim]
+    return embedding + [0.0] * (target_dim - len(embedding))
+
+
+def generate_embedding_gemini(text: str) -> Optional[List[float]]:
+    """Generate embedding using Google Gemini API (free tier)."""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_EMBEDDING_MODEL}:embedContent",
+            params={"key": GEMINI_API_KEY},
+            json={
+                "model": f"models/{GEMINI_EMBEDDING_MODEL}",
+                "content": {"parts": [{"text": text[:8000]}]}
+            },
+            timeout=15
+        )
+        if response.status_code == 200:
+            embedding = response.json().get("embedding", {}).get("values", [])
+            if embedding:
+                return pad_embedding(embedding)  # Pad 768 → 1536 for HelixDB
+        else:
+            print(f"WARNING: Gemini API error {response.status_code}: {response.text[:100]}", file=sys.stderr)
+    except Exception as e:
+        print(f"WARNING: Gemini embedding failed: {e}", file=sys.stderr)
+    return None
+
+def check_ollama_running() -> bool:
+    """Check if Ollama is accessible (legacy fallback)."""
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def generate_embedding_ollama(text: str) -> Optional[List[float]]:
+    """Generate embedding using Ollama (fallback). Note: nomic-embed-text is 768 dims."""
+    try:
+        response = requests.post(
+            f"{OLLAMA_URL}/api/embeddings",
+            json={"model": OLLAMA_MODEL, "prompt": text[:8000]},
+            timeout=30
+        )
+        if response.status_code == 200:
+            embedding = response.json().get("embedding")
+            if embedding:
+                return pad_embedding(embedding)  # Pad 768 → 1536 for HelixDB
+    except Exception as e:
+        print(f"WARNING: Ollama embedding failed: {e}", file=sys.stderr)
+    return None
+
+def generate_embedding_hash(text: str, dim: int = EMBEDDING_DIM) -> List[float]:
+    """Fallback: Generate deterministic pseudo-embedding from text hash."""
+    import hashlib
+    normalized = ' '.join(text.lower().split())[:2000]
+    text_hash = hashlib.sha256(normalized.encode()).hexdigest()
+    vector = []
+    for i in range(dim):
+        byte_val = int(text_hash[(i * 2) % len(text_hash)], 16)
+        vector.append((byte_val - 7.5) / 7.5)
+    return vector
+
+def generate_embedding(text: str) -> Tuple[List[float], str]:
+    """
+    Generate embedding with best available method + caching.
+    Priority: Cache > Ollama (local, private) > Gemini (free API) > hash (fallback)
+
+    Returns:
+        (vector, model_name)
+    """
+    global _embedding_cache
+
+    # Check cache first
+    cache_key = content_hash(text)
+    if cache_key in _embedding_cache:
+        return _embedding_cache[cache_key]
+
+    # Try Ollama first (local, keeps data private)
+    if check_ollama_running():
+        embedding = generate_embedding_ollama(text)
+        if embedding:
+            result = (embedding, OLLAMA_MODEL)
+            _cache_embedding(cache_key, result)
+            return result
+
+    # Fallback to Gemini (free API, but sends data externally)
+    embedding = generate_embedding_gemini(text)
+    if embedding:
+        result = (embedding, GEMINI_EMBEDDING_MODEL)
+        _cache_embedding(cache_key, result)
+        return result
+
+    # Hash-based fallback (always works but not semantic)
+    result = (generate_embedding_hash(text), "hash-fallback")
+    _cache_embedding(cache_key, result)
+    return result
+
+
+def _cache_embedding(key: str, value: Tuple[List[float], str]) -> None:
+    """Add embedding to cache, evicting oldest if full."""
+    global _embedding_cache
+    if len(_embedding_cache) >= _CACHE_MAX_SIZE:
+        # Simple eviction: remove first item (oldest in insertion order)
+        first_key = next(iter(_embedding_cache))
+        del _embedding_cache[first_key]
+    _embedding_cache[key] = value
+
+# Backward compat alias
+def generate_simple_embedding(text: str) -> List[float]:
+    """Legacy function - returns just the vector."""
+    vector, _ = generate_embedding(text)
+    return vector
+
+# ============================================================================
+# LLM TEXT GENERATION (Scribe functions)
+# ============================================================================
+
+def generate_with_ollama(prompt: str, timeout: int = 60) -> Optional[str]:
+    """Generate text using Ollama (local, free)."""
+    try:
+        response = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": OLLAMA_LLM_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.3,  # Lower for more consistent JSON
+                    "num_predict": 2000,
+                }
+            },
+            timeout=timeout
+        )
+        if response.status_code == 200:
+            return response.json().get("response", "")
+    except requests.exceptions.Timeout:
+        print(f"WARNING: Ollama timeout after {timeout}s", file=sys.stderr)
+    except Exception as e:
+        print(f"WARNING: Ollama generation failed: {e}", file=sys.stderr)
+    return None
+
+def generate_with_gemini(prompt: str, timeout: int = 60) -> Optional[str]:
+    """Generate text using Gemini Flash API (free tier)."""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_LLM_MODEL}:generateContent",
+            params={"key": GEMINI_API_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "maxOutputTokens": 1000,
+                }
+            },
+            timeout=timeout
+        )
+        if response.status_code == 200:
+            result = response.json()
+            candidates = result.get("candidates", [])
+            if candidates:
+                content = candidates[0].get("content", {})
+                parts = content.get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+        else:
+            print(f"WARNING: Gemini LLM error {response.status_code}: {response.text[:100]}", file=sys.stderr)
+    except requests.exceptions.Timeout:
+        print(f"WARNING: Gemini timeout after {timeout}s", file=sys.stderr)
+    except Exception as e:
+        print(f"WARNING: Gemini generation failed: {e}", file=sys.stderr)
+    return None
+
+
+def llm_generate(prompt: str, timeout: int = 60) -> Tuple[Optional[str], str]:
+    """
+    Generate text with best available LLM.
+    Priority: Ollama (local, private) > Gemini Flash (free API, external)
+
+    PRIVACY: Ollama is preferred because it keeps all data local.
+    Gemini is only used as fallback when Ollama unavailable.
+    """
+    # Try Ollama first (local, keeps data private)
+    if check_ollama_running():
+        output = generate_with_ollama(prompt, timeout)
+        if output:
+            return output, f"ollama/{OLLAMA_LLM_MODEL}"
+
+    # Fallback to Gemini Flash (free, but sends data externally)
+    if GEMINI_API_KEY:
+        print("WARNING: Ollama unavailable, falling back to Gemini (external API)", file=sys.stderr)
+        output = generate_with_gemini(prompt, timeout)
+        if output:
+            return output, f"gemini/{GEMINI_LLM_MODEL}"
+
+    print("WARNING: No LLM available (Ollama down, no Gemini key)", file=sys.stderr)
+    return None, "none"
+
+def extract_json_array(text: str) -> list:
+    """Extract JSON array from LLM output (handles markdown code blocks)."""
+    if not text:
+        return []
+
+    # Remove markdown code blocks if present
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first and last lines (``` markers)
+        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    # Find JSON array
+    start = text.find('[')
+    end = text.rfind(']')
+    if start != -1 and end != -1 and end > start:
+        try:
+            result = json.loads(text[start:end + 1])
+            return result if isinstance(result, list) else []
+        except json.JSONDecodeError:
+            pass
+    return []
+
+# ============================================================================
+# MEMORY STORAGE
+# ============================================================================
+
+def store_memory(content: str, category: str, importance: int, tags: str, source: str = "hook") -> Optional[str]:
+    """Store a memory to HelixDB with full metadata including timestamp."""
+    if not check_helix_running():
+        return None
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/StoreMemory",
+            json={
+                "content": content,
+                "category": category,
+                "importance": importance,
+                "tags": tags,
+                "source": source,
+                "created_at": datetime.now().isoformat()
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result.get("memory", {}).get("id")
+    except Exception as e:
+        print(f"ERROR: Failed to store memory: {e}", file=sys.stderr)
+        return None
+
+def store_memory_embedding(memory_id: str, vector: List[float], content: str, model: str = "unknown") -> bool:
+    """Store embedding for a memory."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/StoreMemoryEmbedding",
+            json={
+                "memory_id": memory_id,
+                "vector": vector,
+                "content": content,
+                "model": model
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to store embedding: {e}", file=sys.stderr)
+        return False
+
+def delete_memory(memory_id: str) -> bool:
+    """Delete a memory from HelixDB."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/DeleteMemory",
+            json={"id": memory_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to delete memory {memory_id}: {e}", file=sys.stderr)
+        return False
+
+def deactivate_memory(memory_id: str) -> bool:
+    """Soft-delete a memory (mark inactive)."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/DeactivateMemory",
+            json={"id": memory_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to deactivate memory: {e}", file=sys.stderr)
+        return False
+
+# ============================================================================
+# MEMORY RETRIEVAL
+# ============================================================================
+
+def get_all_memories() -> List[Dict]:
+    """Retrieve all memories from HelixDB."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetAllMemories",
+            json={},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result.get("memories", [])
+    except Exception as e:
+        print(f"ERROR: Failed to get memories: {e}", file=sys.stderr)
+        return []
+
+def get_active_memories() -> List[Dict]:
+    """Get only active (non-deleted) memories."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetActiveMemories",
+            json={},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result.get("memories", [])
+    except Exception as e:
+        # Fallback: filter locally
+        all_mems = get_all_memories()
+        return [m for m in all_mems if m.get("is_active", True)]
+
+def get_memories_by_time_window(window: str = "contextual") -> List[Dict]:
+    """
+    Get memories filtered by time window.
+
+    Args:
+        window: "recent" (4h), "contextual" (30d), "deep" (90d), "full" (all)
+
+    Returns:
+        List of memories within the time window
+    """
+    memories = get_active_memories()
+    hours = TIME_WINDOWS.get(window)
+
+    if hours is None:  # "full" - return all
+        return memories
+
+    cutoff = datetime.now() - timedelta(hours=hours)
+
+    filtered = []
+    for m in memories:
+        created_at = m.get("created_at")
+        if created_at:
+            try:
+                # Parse ISO format timestamp
+                mem_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                if mem_time.replace(tzinfo=None) >= cutoff:
+                    filtered.append(m)
+            except:
+                # Can't parse timestamp, include it
+                filtered.append(m)
+        else:
+            # No timestamp, include it
+            filtered.append(m)
+
+    return filtered
+
+def get_memories_by_category(category: str) -> List[Dict]:
+    """Get memories filtered by category."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetMemoriesByCategory",
+            json={"category": category},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result.get("memories", [])
+    except:
+        # Fallback: filter locally
+        all_mems = get_active_memories()
+        return [m for m in all_mems if m.get("category") == category]
+
+def get_high_importance_memories(min_importance: int = 8) -> List[Dict]:
+    """Get memories with importance >= threshold."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetHighImportanceMemories",
+            json={"min_importance": min_importance},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result.get("memories", [])
+    except:
+        # Fallback: filter locally
+        all_mems = get_active_memories()
+        return [m for m in all_mems if m.get("importance", 0) >= min_importance]
+
+# ============================================================================
+# SEMANTIC SEARCH
+# ============================================================================
+
+def search_by_similarity(query: str, k: int = 10, window: str = "contextual") -> List[Dict]:
+    """
+    Semantic search using vector similarity.
+
+    Args:
+        query: Search query text
+        k: Number of results to return
+        window: Time window filter
+
+    Returns:
+        List of semantically similar memories
+    """
+    if not check_helix_running():
+        return []
+
+    # Generate query embedding
+    query_vector, _ = generate_embedding(query)
+
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/SearchBySimilarity",
+            json={"query_vector": query_vector, "k": k},
+            headers={"Content-Type": "application/json"},
+            timeout=15
+        )
+        response.raise_for_status()
+        result = response.json()
+        memories = result.get("memories", [])
+
+        # Apply time window filter
+        if window != "full":
+            hours = TIME_WINDOWS.get(window, 720)
+            cutoff = datetime.now() - timedelta(hours=hours)
+            memories = [m for m in memories if _memory_in_window(m, cutoff)]
+
+        return memories
+    except Exception as e:
+        print(f"ERROR: Similarity search failed: {e}", file=sys.stderr)
+        return []
+
+def search_by_text(query: str, flexible: bool = False) -> List[Dict]:
+    """
+    Full-text search on memory content.
+
+    Args:
+        query: Search query
+        flexible: If True, splits query into words and searches for any match
+    """
+    if not check_helix_running():
+        return []
+
+    if not flexible:
+        # Standard substring search
+        try:
+            response = requests.post(
+                f"{HELIX_URL}/SearchByText",
+                json={"query": query},
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result.get("memories", [])
+        except:
+            # Fallback: local search
+            all_mems = get_active_memories()
+            query_lower = query.lower()
+            return [m for m in all_mems if query_lower in m.get("content", "").lower()]
+    else:
+        # Flexible search: split query into words and find memories containing any
+        all_mems = get_active_memories()
+        query_words = [w.strip('.,!?;:').lower() for w in query.lower().split() if len(w) > 2]
+
+        if not query_words:
+            return []
+
+        # Score memories by number of matching words
+        scored = {}
+        for m in all_mems:
+            content_lower = m.get("content", "").lower()
+            tags_lower = m.get("tags", "").lower()
+            combined = f"{content_lower} {tags_lower}"
+
+            # Count matching words
+            matches = sum(1 for word in query_words if word in combined)
+            if matches > 0:
+                mid = m.get("id")
+                if mid:
+                    scored[mid] = {"memory": m, "score": matches}
+
+        # Sort by score
+        ranked = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
+        return [r["memory"] for r in ranked]
+
+def hybrid_search(query: str, k: int = 10, window: str = "contextual") -> List[Dict]:
+    """
+    Hybrid search combining vector similarity + text matching.
+
+    Merges results from both methods, deduplicates, and ranks.
+    """
+    # Get results from both methods
+    vector_results = search_by_similarity(query, k=k*2, window=window)
+    text_results = search_by_text(query)
+
+    # If both failed or returned nothing, try flexible text search
+    if not vector_results and not text_results:
+        text_results = search_by_text(query, flexible=True)
+
+    # Score and merge
+    scored = {}
+
+    # Vector results get base score from position
+    for i, m in enumerate(vector_results):
+        mid = m.get("id")
+        if mid:
+            scored[mid] = {"memory": m, "score": (k*2 - i) * 2}  # Higher weight for vector
+
+    # Text results add score
+    for i, m in enumerate(text_results):
+        mid = m.get("id")
+        if mid:
+            if mid in scored:
+                scored[mid]["score"] += (len(text_results) - i)
+            else:
+                scored[mid] = {"memory": m, "score": (len(text_results) - i)}
+
+    # Sort by score and return top k
+    ranked = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
+    return [r["memory"] for r in ranked[:k]]
+
+def _memory_in_window(memory: Dict, cutoff: datetime) -> bool:
+    """Check if memory is within time window."""
+    created_at = memory.get("created_at")
+    if not created_at:
+        return True
+    try:
+        mem_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        return mem_time.replace(tzinfo=None) >= cutoff
+    except:
+        return True
+
+# ============================================================================
+# REASONING CHAINS
+# ============================================================================
+
+def create_implication(from_id: str, to_id: str, confidence: int = 8, reason: str = "") -> bool:
+    """Create IMPLIES relationship between memories."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/CreateImplication",
+            json={"from_id": from_id, "to_id": to_id, "confidence": confidence, "reason": reason},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to create implication: {e}", file=sys.stderr)
+        return False
+
+def create_contradiction(from_id: str, to_id: str, severity: int = 5, resolution: str = "newer_wins") -> bool:
+    """Create CONTRADICTS relationship between memories."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/CreateContradiction",
+            json={"from_id": from_id, "to_id": to_id, "severity": severity, "resolution": resolution},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to create contradiction: {e}", file=sys.stderr)
+        return False
+
+def create_causal_link(from_id: str, to_id: str, strength: int = 8) -> bool:
+    """Create BECAUSE relationship (causal chain)."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/CreateCausalLink",
+            json={"from_id": from_id, "to_id": to_id, "strength": strength},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to create causal link: {e}", file=sys.stderr)
+        return False
+
+def create_supersedes(new_id: str, old_id: str) -> bool:
+    """Create SUPERSEDES relationship (new memory replaces old)."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/CreateSupersedes",
+            json={"new_id": new_id, "old_id": old_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to create supersedes: {e}", file=sys.stderr)
+        return False
+
+def get_implications(memory_id: str) -> List[Dict]:
+    """Get what a memory implies (forward reasoning)."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetImplications",
+            json={"memory_id": memory_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("implied", [])
+    except:
+        return []
+
+def get_contradictions(memory_id: str) -> List[Dict]:
+    """Get contradicting memories."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetContradictions",
+            json={"memory_id": memory_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("conflicts", [])
+    except:
+        return []
+
+def get_reasoning_chain(memory_id: str, depth: int = 3) -> List[Dict]:
+    """Get full reasoning chain for a memory."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetReasoningChain",
+            json={"memory_id": memory_id, "depth": depth},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("chain", [])
+    except:
+        return []
+
+# ============================================================================
+# DEDUPLICATION
+# ============================================================================
+
+def content_hash(content: str) -> str:
+    """Generate a hash of content for deduplication."""
+    import hashlib
+    normalized = ' '.join(content.lower().split())[:200]
+    return hashlib.md5(normalized.encode()).hexdigest()
+
+def find_similar_memories(content: str, category: str = None, tags: str = None) -> List[Dict]:
+    """Find similar memories by content matching."""
+    memories = get_active_memories()
+
+    if category:
+        memories = [m for m in memories if m.get("category") == category]
+
+    new_hash = content_hash(content)
+    content_key = content[:100].lower().strip()
+    similar = []
+
+    for memory in memories:
+        memory_content = memory.get("content", "")
+        if content_hash(memory_content) == new_hash:
+            similar.append(memory)
+            continue
+        if memory_content[:100].lower().strip() == content_key:
+            similar.append(memory)
+            continue
+        if tags and tags in memory.get("tags", ""):
+            words_new = set(content_key.split())
+            words_existing = set(memory_content[:100].lower().split())
+            overlap = len(words_new & words_existing) / max(len(words_new), 1)
+            if overlap > 0.7:
+                similar.append(memory)
+
+    return similar
+
+# ============================================================================
+# CONTEXT MANAGEMENT
+# ============================================================================
+
+def create_context(name: str, description: str, context_type: str) -> Optional[str]:
+    """Create a new context."""
+    if not check_helix_running():
+        return None
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/CreateContext",
+            json={"name": name, "description": description, "context_type": context_type},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("context", {}).get("id")
+    except Exception as e:
+        print(f"ERROR: Failed to create context: {e}", file=sys.stderr)
+        return None
+
+def link_memory_to_context(memory_id: str, context_id: str) -> bool:
+    """Link a memory to a context."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/LinkMemoryToContext",
+            json={"memory_id": memory_id, "context_id": context_id, "relevance": 5},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"ERROR: Failed to link memory to context: {e}", file=sys.stderr)
+        return False
+
+def get_all_contexts() -> List[Dict]:
+    """Retrieve all contexts."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetAllContexts",
+            json={},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("contexts", [])
+    except:
+        return []
+
+# ============================================================================
+# RELATIONSHIP DETECTION & CONTEXTUAL SEARCH
+# ============================================================================
+
+def detect_environment_from_path(path: str) -> Optional[str]:
+    """
+    Detect environment/system from a path.
+    Examples:
+      - /Users/x/.wp-test/sites/fiverr.loc → 'wp-test'
+      - /Users/x/Sites/example.local → 'local-sites'
+      - /Users/x/docker/project → 'docker'
+    """
+    path = path.lower()
+
+    # Known environment patterns
+    if '.wp-test' in path or 'wp-test' in path:
+        return 'wp-test'
+    if '/docker/' in path or path.startswith('/var/lib/docker'):
+        return 'docker'
+    if '/sites/' in path and ('.local' in path or '.loc' in path):
+        return 'local-sites'
+    if '/.venv/' in path or '/venv/' in path:
+        return 'python-venv'
+
+    return None
+
+def extract_related_tags(query: str, memories: List[Dict]) -> List[str]:
+    """
+    Extract related tags from query and existing memories.
+    Used to find contextually related memories.
+    """
+    related_tags = set()
+    query_lower = query.lower()
+
+    # Known environment → related tags mapping
+    environments = {
+        'wp-test': ['wordpress', 'docker', 'wp-cli', 'mysql'],
+        'docker': ['container', 'compose', 'dockerfile'],
+        'wordpress': ['wp-test', 'php', 'mysql', 'wp-cli'],
+        'python': ['pip', 'venv', 'pytest', 'django', 'fastapi'],
+        'node': ['npm', 'yarn', 'javascript', 'typescript'],
+    }
+
+    # Check if query mentions any environments
+    for env, tags in environments.items():
+        if env in query_lower:
+            related_tags.update(tags)
+
+    # Extract tags from query
+    for word in query_lower.split():
+        word = word.strip('.,!?;:')
+        if len(word) > 3:  # Skip short words
+            related_tags.add(word)
+
+    return list(related_tags)
+
+def get_or_create_context(name: str, description: str, context_type: str = "environment") -> Optional[str]:
+    """Get existing context or create new one."""
+    if not check_helix_running():
+        return None
+
+    # Check if context exists
+    contexts = get_all_contexts()
+    for ctx in contexts:
+        if ctx.get('name', '').lower() == name.lower():
+            return ctx.get('id')
+
+    # Create new context
+    return create_context(name, description, context_type)
+
+def link_memory_to_environment(memory_id: str, environment: str) -> bool:
+    """
+    Link a memory to its environment context.
+    Automatically creates context if it doesn't exist.
+    """
+    # Environment descriptions
+    env_descriptions = {
+        'wp-test': 'WordPress local development environment using Docker',
+        'docker': 'Docker containerized applications',
+        'local-sites': 'Local development sites (.local, .loc domains)',
+        'python-venv': 'Python virtual environments',
+    }
+
+    description = env_descriptions.get(environment, f'{environment} environment')
+    context_id = get_or_create_context(environment, description, 'environment')
+
+    if context_id:
+        return link_memory_to_context(memory_id, context_id, relevance=7)
+
+    return False
+
+def expand_query_with_relationships(query: str, cwd: str = "") -> List[str]:
+    """
+    Expand a search query with related terms based on relationships.
+
+    Examples:
+      - "credentials" in wp-test → ["credentials", "wp-test credentials", "wp-test login", "wp-test password", "wp-test admin", "default login"]
+      - "docker setup" → ["docker setup", "docker-compose", "container configuration"]
+    """
+    queries = [query]
+    query_lower = query.lower()
+
+    # Intent synonyms - map common terms to related search terms
+    intent_synonyms = {
+        'credential': ['login', 'password', 'admin', 'auth', 'username', 'user'],
+        'credentials': ['login', 'password', 'admin', 'auth', 'username', 'user'],
+        'login': ['credential', 'password', 'admin', 'auth', 'username'],
+        'password': ['login', 'credential', 'admin', 'auth'],
+        'auth': ['login', 'credential', 'password', 'admin'],
+        'setup': ['install', 'configuration', 'config', 'initialize'],
+        'config': ['configuration', 'setup', 'settings'],
+        'error': ['bug', 'issue', 'problem', 'fix'],
+        'deploy': ['deployment', 'publish', 'release'],
+    }
+
+    # Detect environment from CWD
+    env = None
+    if cwd:
+        env = detect_environment_from_path(cwd)
+        if env and env not in query_lower:
+            queries.append(f"{env} {query}")
+
+    # Expand with intent synonyms + environment
+    for intent, synonyms in intent_synonyms.items():
+        if intent in query_lower:
+            # Add synonyms with environment prefix if available
+            if env:
+                for synonym in synonyms[:3]:  # Limit to top 3 to avoid explosion
+                    queries.append(f"{env} {synonym}")
+
+            # Add standalone related terms
+            for synonym in synonyms[:2]:  # Add fewer standalone
+                if synonym not in query_lower:
+                    queries.append(f"default {synonym}")
+            break  # Only expand for the first matching intent
+
+    # Project → Environment mappings
+    if '.loc' in query_lower or '.local' in query_lower:
+        # WordPress site query - also search for wp-test
+        if 'wp-test' not in query_lower:
+            queries.append(query.replace('.loc', '').replace('.local', '') + ' wp-test')
+
+        # If searching for credentials/login, add generic wordpress terms
+        if any(term in query_lower for term in ['credential', 'login', 'password', 'user']):
+            queries.append('wordpress default login')
+            queries.append('wp-test admin password')
+
+    # Docker queries
+    if 'docker' in query_lower:
+        if 'compose' not in query_lower:
+            queries.append(query + ' compose')
+
+    # Python queries
+    if 'python' in query_lower or 'venv' in query_lower:
+        if 'pip' not in query_lower:
+            queries.append(query + ' pip')
+
+    return queries
+
+def contextual_search(query: str, k: int = 10, cwd: str = "", expand: bool = True) -> List[Dict]:
+    """
+    Enhanced search that understands context and relationships.
+
+    Args:
+        query: Search query
+        k: Number of results
+        cwd: Current working directory (for context detection)
+        expand: Whether to expand query with relationships
+
+    Returns:
+        List of memories with relationship-aware ranking
+    """
+    if not check_helix_running():
+        return []
+
+    # Identify key intent terms (credentials, password, setup, etc.)
+    intent_terms = {
+        'credential': 15,
+        'password': 15,
+        'login': 15,
+        'username': 12,
+        'auth': 12,
+        'setup': 8,
+        'configuration': 8,
+        'install': 6,
+        'error': 6,
+        'bug': 6,
+    }
+
+    # Expand query if enabled
+    queries = expand_query_with_relationships(query, cwd) if expand else [query]
+
+    # Collect results from all expanded queries
+    all_results = {}
+
+    for q in queries:
+        # Use flexible text search for expanded queries since vector search may fail
+        results = search_by_text(q, flexible=True) if queries.index(q) > 0 else hybrid_search(q, k=k*2, window="full")
+
+        # Score based on query position (original query = highest score)
+        query_score = len(queries) - queries.index(q)
+
+        for r in results:
+            mid = r.get('id')
+            if mid:
+                if mid not in all_results:
+                    all_results[mid] = {"memory": r, "score": 0}
+                all_results[mid]["score"] += query_score
+
+    # Boost scores based on intent matching
+    query_lower = query.lower()
+    for term, boost in intent_terms.items():
+        if term in query_lower:
+            # Boost memories that are primarily about this intent
+            # Also check related terms (e.g., "login" relates to "credential")
+            related_terms = {
+                'credential': ['login', 'password', 'admin', 'user', 'auth'],
+                'password': ['login', 'credential', 'admin'],
+                'login': ['credential', 'password', 'admin', 'user'],
+            }
+
+            search_terms = [term] + related_terms.get(term, [])
+
+            for mid, data in all_results.items():
+                content_lower = data["memory"].get("content", "").lower()
+                category = data["memory"].get("category", "")
+
+                # Check if any search term matches
+                for search_term in search_terms:
+                    # High boost if content starts with or heavily features the term
+                    if content_lower.startswith(search_term) or f'{search_term}:' in content_lower or f'{search_term} (' in content_lower:
+                        data["score"] += boost
+                        break
+                    # Medium boost if category matches (e.g., "fact" for credentials)
+                    elif search_term in content_lower and category in ['fact', 'preference', 'solution']:
+                        data["score"] += boost // 2
+                        break
+
+    # Also search by environment context
+    if cwd:
+        env = detect_environment_from_path(cwd)
+        if env:
+            # Get memories in this environment context
+            contexts = get_all_contexts()
+            for ctx in contexts:
+                if ctx.get('name', '').lower() == env.lower():
+                    context_id = ctx.get('id')
+                    try:
+                        response = requests.post(
+                            f"{HELIX_URL}/GetMemoriesInContext",
+                            json={"context_id": context_id},
+                            headers={"Content-Type": "application/json"},
+                            timeout=10
+                        )
+                        if response.status_code == 200:
+                            ctx_memories = response.json().get("memories", [])
+                            # Filter by query relevance
+                            for m in ctx_memories:
+                                if any(term in m.get('content', '').lower() for term in query.lower().split()):
+                                    mid = m.get('id')
+                                    if mid:
+                                        if mid not in all_results:
+                                            all_results[mid] = {"memory": m, "score": 0}
+                                        all_results[mid]["score"] += 3  # Context bonus
+                    except:
+                        pass
+
+    # Extract related tags and search by them
+    related_tags = extract_related_tags(query, [])
+    for tag in related_tags[:3]:  # Limit to top 3 tags
+        try:
+            response = requests.post(
+                f"{HELIX_URL}/SearchByTag",
+                json={"tag": tag},
+                headers={"Content-Type": "application/json"},
+                timeout=5
+            )
+            if response.status_code == 200:
+                tag_memories = response.json().get("memories", [])
+                for m in tag_memories[:5]:  # Top 5 from each tag
+                    mid = m.get('id')
+                    if mid:
+                        if mid not in all_results:
+                            all_results[mid] = {"memory": m, "score": 0}
+                        all_results[mid]["score"] += 1  # Small tag bonus
+        except:
+            pass
+
+    # Sort by combined score
+    ranked = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
+    return [r["memory"] for r in ranked[:k]]
+
+# ============================================================================
+# LEGACY / BACKWARD COMPAT
+# ============================================================================
+
+def link_related_memories(from_id: str, to_id: str, relationship: str, strength: int) -> bool:
+    """Link two memories with a relationship (legacy)."""
+    if relationship == "supersedes":
+        return create_supersedes(from_id, to_id)
+    elif relationship == "implies":
+        return create_implication(from_id, to_id, confidence=strength)
+    elif relationship == "contradicts":
+        return create_contradiction(from_id, to_id, severity=strength)
+    elif relationship == "because":
+        return create_causal_link(from_id, to_id, strength=strength)
+
+    # Generic relationship
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/LinkRelatedMemories",
+            json={"from_id": from_id, "to_id": to_id, "relationship": relationship, "strength": strength},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except:
+        return False
+
+def search_project_locations(project_name: str = None) -> List[Dict]:
+    """Search for stored project locations."""
+    memories = get_active_memories()
+    locations = [m for m in memories if "location" in m.get("tags", "") or "path" in m.get("tags", "")]
+    if project_name:
+        project_name_lower = project_name.lower()
+        locations = [m for m in locations if project_name_lower in m.get("content", "").lower()]
+    return locations
+
+# ============================================================================
+# HOOK OUTPUT
+# ============================================================================
+
+def format_hook_output(message: str = "", suppress: bool = False, additional_data: Optional[Dict] = None) -> Dict[str, Any]:
+    """Format hook output JSON."""
+    output = {"suppressOutput": suppress}
+    if additional_data:
+        output.update(additional_data)
+    return output
+
+def print_hook_output(output: Dict[str, Any], stderr_message: str = ""):
+    """Print hook output JSON and optional stderr message."""
+    print(json.dumps(output))
+    if stderr_message:
+        print(stderr_message, file=sys.stderr)
