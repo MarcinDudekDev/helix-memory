@@ -36,7 +36,7 @@ def get_known_projects() -> list:
             for line in result.stdout.split('\n'):
                 if ':' in line:
                     name = line.split(':')[0].strip()
-                    if name and name != 'cminds':
+                    if name and name.lower() not in ('users', 'home', 'root'):
                         projects.append(name)
             return projects
     except:

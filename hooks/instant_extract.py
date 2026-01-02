@@ -6,7 +6,7 @@ Zero-latency extraction using regex patterns and inline markers.
 No LLM required. Runs synchronously in the Stop hook.
 
 Extracts:
-1. Paths: ~/foo/bar, /Users/cminds/Sites/project
+1. Paths: ~/foo/bar, /Users/username/Sites/project
 2. URLs: https://example.com, localhost:3000
 3. Inline markers: <!-- MEM: category | content -->
 4. Explicit triggers: "remember that", "always use", "prefer"
@@ -305,7 +305,7 @@ if __name__ == "__main__":
         test_assistant = """
         Got it! I'll work with the project at ~/Sites/level2-academy.
 
-        I found the config at /Users/cminds/Sites/level2-academy/config.py
+        I found the config at ~/Sites/my-project/config.py
         The API is running at localhost:8000
 
         <!-- MEM: preference | User strongly prefers Datastar for frontend -->

@@ -6,9 +6,7 @@ Persistent memory system enabling Claude to remember user preferences, project c
 
 **ALWAYS use the `memory` bash script** - never call Python scripts directly.
 
-```bash
-MEMORY="/Users/cminds/Tools/helix-memory/memory"
-```
+After installation, use the `memory` command directly or via alias.
 
 ## Quick Links
 
@@ -20,7 +18,6 @@ MEMORY="/Users/cminds/Tools/helix-memory/memory"
 ## Installation Status
 
 - ✅ HelixDB CLI installed
-- ✅ Project initialized at `/Users/cminds/Tools/helix-memory`
 - ✅ Schema defined and compiled
 - ✅ Queries implemented
 - ✅ Bash CLI with Docker auto-start
@@ -29,32 +26,32 @@ MEMORY="/Users/cminds/Tools/helix-memory/memory"
 
 ### Start Database (auto-starts Docker if needed)
 ```bash
-/Users/cminds/Tools/helix-memory/memory start
+memory start
 ```
 
 ### Check Status
 ```bash
-/Users/cminds/Tools/helix-memory/memory status
+memory status
 ```
 
 ### Store a Memory
 ```bash
-/Users/cminds/Tools/helix-memory/memory store "User prefers concise responses" -t preference -i 10 -g "communication,style"
+memory store "User prefers concise responses" -t preference -i 10 -g "communication,style"
 ```
 
 ### Quick Store (auto-categorizes)
 ```bash
-/Users/cminds/Tools/helix-memory/memory remember "User prefers concise responses"
+memory remember "User prefers concise responses"
 ```
 
 ### List Memories
 ```bash
-/Users/cminds/Tools/helix-memory/memory list --limit 10
+memory list --limit 10
 ```
 
 ### Stop Database
 ```bash
-/Users/cminds/Tools/helix-memory/memory stop
+memory stop
 ```
 
 ## File Structure
@@ -121,22 +118,20 @@ helix-memory/
 **Always use the `memory` bash script:**
 
 ```bash
-MEMORY="/Users/cminds/Tools/helix-memory/memory"
-
 # Service commands
-$MEMORY start      # Start HelixDB (auto-starts Docker Desktop if needed)
-$MEMORY stop       # Stop HelixDB
-$MEMORY restart    # Restart HelixDB
-$MEMORY status     # Check status and memory count
+memory start      # Start HelixDB (auto-starts Docker Desktop if needed)
+memory stop       # Stop HelixDB
+memory restart    # Restart HelixDB
+memory status     # Check status and memory count
 
 # Memory commands
-$MEMORY search "query"              # Search memories
-$MEMORY list --limit 10             # List all memories
-$MEMORY remember "text"             # Quick store (auto-categorizes)
-$MEMORY store "text" -t cat -i N    # Store with category/importance
-$MEMORY delete <id>                 # Delete by ID
-$MEMORY tag "tagname"               # Find by tag
-$MEMORY help                        # Show all commands
+memory search "query"              # Search memories
+memory list --limit 10             # List all memories
+memory remember "text"             # Quick store (auto-categorizes)
+memory store "text" -t cat -i N    # Store with category/importance
+memory delete <id>                 # Delete by ID
+memory tag "tagname"               # Find by tag
+memory help                        # Show all commands
 ```
 
 ## API Access (When Deployed)
@@ -162,30 +157,12 @@ See [examples/session_workflow.md](examples/session_workflow.md)
 ### Semantic Search Patterns
 See [examples/semantic_search.md](examples/semantic_search.md)
 
-## Current Limitations
-
-1. **Docker build failing** - Cargo compilation issue, non-critical
-2. **No embedding generation** - Requires separate service
-3. **API not yet tested** - Pending successful deployment
-4. **No automated workflows** - Manual operations for now
-
-## Future Enhancements
-
-- [ ] Automated embedding generation
-- [ ] Smart duplicate detection
-- [ ] Importance auto-adjustment
-- [ ] Memory decay over time
-- [ ] Export/import functionality
-- [ ] Backup automation
-- [ ] Web UI for management
-- [ ] Integration with Claude Code workflows
-
 ## Troubleshooting
 
 ### DB Won't Start
 ```bash
 # Use the memory script (handles Docker auto-start)
-/Users/cminds/Tools/helix-memory/memory start
+memory start
 
 # Check container status
 docker ps | grep helix
@@ -194,17 +171,14 @@ docker ps | grep helix
 ### Connection Issues
 ```bash
 # Restart using the memory script
-/Users/cminds/Tools/helix-memory/memory restart
+memory restart
 ```
 
 ## Resources
 
 - **HelixDB Docs:** https://docs.helix-db.com
 - **GitHub:** https://github.com/HelixDB/helix-db
-- **Quickstart:** https://github.com/HelixDB/quickstart
-- **Project:** /Users/cminds/Tools/helix-memory
 
 ## License
 
-This skill documentation is part of the user's private Claude Code skills.
-HelixDB is licensed under AGPL-3.0 (see HelixDB repository).
+MIT

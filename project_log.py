@@ -33,7 +33,7 @@ def get_known_projects() -> dict:
                     parts = line.split(':')
                     name = parts[0].strip()
                     path = parts[1].strip() if len(parts) > 1 else ''
-                    if name and name != 'cminds':
+                    if name and name.lower() not in ('users', 'home', 'root'):
                         projects[name.lower()] = name
             return projects
     except:

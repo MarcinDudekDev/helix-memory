@@ -201,7 +201,7 @@ if __name__ == "__main__":
         "Fixed bug in zbm.co.il WordPress plugin",
         "wp-admin: john_admin password: secret123",
         "API key: sk-abc123xyz, Bearer token123",
-        "Working on /Users/cminds/Tools/level2-academy/wp-content/plugins/my-plugin",
+        "Working on /Users/username/Sites/my-project/wp-content/plugins/my-plugin",
         "DigitalOcean VPS (Project X) with Cloudflare proxy",
         "Check https://github.com/user/repo for docs",  # Should stay
     ]

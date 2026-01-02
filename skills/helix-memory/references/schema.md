@@ -3,7 +3,7 @@
 Complete schema definition for Claude Code's long-term memory system.
 
 ## Schema Location
-`/Users/cminds/Tools/helix-memory/db/schema.hx`
+`db/schema.hx` (in the helix-memory repo root)
 
 ## Node Types
 
@@ -195,10 +195,10 @@ Memory (content, category, importance, tags)
 ## Schema Evolution
 
 To modify schema:
-1. Edit `/Users/cminds/Tools/helix-memory/db/schema.hx`
+1. Edit `db/schema.hx`
 2. Update queries in `db/queries.hx` if needed
-3. Rebuild: `/Users/cminds/.local/bin/helix build dev`
-4. Redeploy: `/Users/cminds/.local/bin/helix push dev`
+3. Rebuild: `helix build dev`
+4. Redeploy: `helix push dev`
 
 **Warning:** Schema changes may require data migration.
 

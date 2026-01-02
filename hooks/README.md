@@ -12,14 +12,14 @@ Three hooks work together to automatically manage long-term memory:
 
 ## Configuration
 
-Hooks are configured in `/Users/cminds/.claude/settings.json`:
+Hooks are configured in `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "Stop": [{"hooks": [{"type": "command", "command": "/path/to/reflect_and_store.py"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/path/to/load_memories.py"}]}],
-    "SessionEnd": [{"hooks": [{"type": "command", "command": "/path/to/session_summary.py"}]}]
+    "Stop": [{"hooks": [{"type": "command", "command": "/path/to/helix-memory/hooks/reflect_and_store.py"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/path/to/helix-memory/hooks/load_memories.py"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "/path/to/helix-memory/hooks/session_summary.py"}]}]
   }
 }
 ```
@@ -48,7 +48,7 @@ Hooks are configured in `/Users/cminds/.claude/settings.json`:
 - **Tasks** (importance 5-8): "need to", "todo", "next step", "blocker"
 - **Facts** (importance 6-8): "i'm using", "my setup", "installed", "configured"
 
-**Output:** "💾 Stored N memories to long-term storage" (shown to user)
+**Output:** "Stored N memories to long-term storage" (shown to user)
 
 ### load_memories.py (UserPromptSubmit Hook)
 
@@ -58,12 +58,6 @@ Hooks are configured in `/Users/cminds/.claude/settings.json`:
 - Extracts keywords from user prompt
 - Searches HelixDB for relevant memories
 - Injects as additional context
-
-**Current Status:**
-- ⚠️ Search disabled until HelixDB bug fixed
-- Ready to enable semantic search when available
-
-**Future:** Will use `SearchMemoriesBySimilarity` with embeddings for intelligent context loading
 
 ### session_summary.py (SessionEnd Hook)
 
@@ -79,63 +73,42 @@ Hooks are configured in `/Users/cminds/.claude/settings.json`:
 - Creates session summary memory
 - Stores with session context
 
-**Output:** "📋 Session summary stored (importance: N)"
-
 ## Data Flow
 
 ### Stop Hook Flow
 ```
 User/Claude messages
-    ↓
+    |
 Transcript written to JSONL
-    ↓
+    |
 Stop hook triggered
-    ↓
+    |
 Parse last 20 messages
-    ↓
+    |
 Pattern matching analysis
-    ↓
+    |
 Store to HelixDB:
   - StoreMemory(content, category, importance, tags)
   - StoreMemoryEmbedding(memory_id, vector, content)
-    ↓
+    |
 Display summary to user
 ```
 
 ### UserPromptSubmit Hook Flow
 ```
 User submits prompt
-    ↓
+    |
 Hook triggered BEFORE Claude sees it
-    ↓
+    |
 Extract keywords
-    ↓
-Search HelixDB (when available)
-    ↓
+    |
+Search HelixDB
+    |
 Format as additional context
-    ↓
+    |
 Inject into prompt
-    ↓
+    |
 Claude processes with context loaded
-```
-
-### SessionEnd Hook Flow
-```
-Session ends
-    ↓
-Parse full transcript
-    ↓
-Summarize session:
-  - Topics
-  - Decisions
-  - Completed tasks
-  - Pending tasks
-    ↓
-Store summary memory
-    ↓
-Create session context
-    ↓
-Link memory to context
 ```
 
 ## Dependencies
@@ -147,7 +120,7 @@ pip install requests
 
 ### HelixDB
 - Must be running at `http://localhost:6969`
-- Start with: `cd /Users/cminds/Tools/helix-memory && helix push dev`
+- Start with: `memory start`
 
 ### Common Module
 All hooks use `common.py` for shared functionality:
@@ -156,7 +129,7 @@ All hooks use `common.py` for shared functionality:
 - `extract_message_content()` - Get text from messages
 - `store_memory()` - Store to HelixDB
 - `store_memory_embedding()` - Store embeddings
-- `generate_simple_embedding()` - Create vectors (placeholder)
+- `generate_embedding()` - Create vectors via Ollama/Gemini
 
 ## Memory Categories
 
@@ -204,20 +177,20 @@ Factual information about environment, setup, tools
 
 ### Test Stop Hook Manually
 ```bash
-echo '{"transcript_path": "/path/to/transcript.jsonl", "session_id": "test-123", "cwd": "/Users/cminds"}' | \
-  python3 /Users/cminds/Tools/helix-memory/hooks/reflect_and_store.py
+echo '{"transcript_path": "/path/to/transcript.jsonl", "session_id": "test-123", "cwd": "/home/user"}' | \
+  python3 ./hooks/reflect_and_store.py
 ```
 
 ### Test UserPromptSubmit Hook
 ```bash
 echo '{"prompt": "How do I test Python code?", "session_id": "test-123"}' | \
-  python3 /Users/cminds/Tools/helix-memory/hooks/load_memories.py
+  python3 ./hooks/load_memories.py
 ```
 
 ### Test SessionEnd Hook
 ```bash
-echo '{"transcript_path": "/path/to/transcript.jsonl", "session_id": "test-123", "cwd": "/Users/cminds"}' | \
-  python3 /Users/cminds/Tools/helix-memory/hooks/session_summary.py
+echo '{"transcript_path": "/path/to/transcript.jsonl", "session_id": "test-123", "cwd": "/home/user"}' | \
+  python3 ./hooks/session_summary.py
 ```
 
 ## Debugging
@@ -227,19 +200,19 @@ Hooks print to stderr. Check Claude Code logs or terminal output.
 
 ### Check If Hooks Are Running
 Look for messages:
-- "💾 Stored N memories to long-term storage"
-- "📋 Session summary stored"
+- "Stored N memories to long-term storage"
+- "Session summary stored"
 
 ### Common Issues
 
 **Hook not executing:**
-- Check `/Users/cminds/.claude/settings.json` for correct paths
+- Check `~/.claude/settings.json` for correct paths
 - Ensure scripts are executable: `chmod +x hooks/*.py`
 - Verify Python 3 available: `python3 --version`
 
 **HelixDB not accessible:**
-- Start HelixDB: `helix push dev`
-- Check status: `helix status`
+- Start HelixDB: `memory start`
+- Check status: `memory status`
 - Verify port 6969: `curl http://localhost:6969/health`
 
 **No memories stored:**
@@ -247,43 +220,10 @@ Look for messages:
 - Check stderr output for warnings
 - Verify conversation has detectable patterns
 
-## Current Limitations
-
-1. **HelixDB deployment blocked** - Waiting for v2.1.3+ bug fix
-2. **Semantic search disabled** - Can't use SearchMemoriesBySimilarity until fixed
-3. **Simple pattern matching** - Using keywords instead of LLM analysis
-4. **Dummy embeddings** - Placeholder until real embedding service integrated
-5. **No memory retrieval** - UserPromptSubmit hook won't load context until search works
-
-## Future Enhancements
-
-### When HelixDB is Fixed
-- [ ] Enable semantic search in `load_memories.py`
-- [ ] Implement collection queries (GetAllMemories, GetMemoriesInContext)
-- [ ] Add memory deduplication
-- [ ] Implement importance decay over time
-
-### Embedding Generation
-- [ ] Integrate Anthropic API for embeddings
-- [ ] Or use OpenAI embeddings
-- [ ] Or local sentence-transformers model
-
-### Advanced Analysis
-- [ ] Use Haiku API for intelligent memory extraction
-- [ ] Implement prompt-based hooks (simpler config)
-- [ ] Add memory consolidation logic
-- [ ] Implement relationship detection (LinkRelatedMemories)
-
-### Memory Management
-- [ ] Add memory pruning (remove low-importance old memories)
-- [ ] Implement memory updates (supersede old info)
-- [ ] Create memory export/import
-- [ ] Add backup automation
-
 ## Files
 
 ```
-/Users/cminds/Tools/helix-memory/hooks/
+hooks/
 ├── README.md                  # This file
 ├── common.py                  # Shared utilities
 ├── reflect_and_store.py       # Stop hook
@@ -294,6 +234,4 @@ Look for messages:
 ## Resources
 
 - **HelixDB Docs:** https://docs.helix-db.com
-- **Helix Memory Skill:** `/Users/cminds/.claude/skills/helix-memory/skill.md`
-- **Claude Code Hooks:** (documentation in Claude Code docs)
-- **Settings:** `/Users/cminds/.claude/settings.json`
+- **Claude Code Hooks:** https://docs.anthropic.com/en/docs/claude-code/hooks

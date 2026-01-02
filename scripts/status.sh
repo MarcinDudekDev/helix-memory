@@ -1,7 +1,7 @@
 #!/bin/bash
 # Quick status check for HelixDB memory system
 
-HELIX_BIN="/Users/cminds/.local/bin/helix"
+HELIX_BIN="${HELIX_BIN:-$(which helix 2>/dev/null || echo "$HOME/.local/bin/helix")}"
 HELIX_URL="http://localhost:6969"
 
 echo "=== HelixDB Memory Status ==="
@@ -59,6 +59,6 @@ else
     echo "Status: NOT RUNNING"
     echo ""
     echo "Start with:"
-    echo "  cd /Users/cminds/Tools/helix-memory && helix push dev"
+    echo "  memory start"
     exit 1
 fi

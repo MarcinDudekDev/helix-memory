@@ -160,7 +160,8 @@ def get_recent_memories(days: int = 7) -> dict:
                 continue
 
             # Skip generic root directories (but keep 'tools' - important productivity work)
-            if tag.lower() == 'cminds':
+            # Skip usernames that might appear as project names
+            if tag.lower() in ('users', 'home', 'root'):
                 continue
 
             # Normalize tag for matching
@@ -169,7 +170,8 @@ def get_recent_memories(days: int = 7) -> dict:
             # Check if tag matches any known project
             matched = False
             for proj in known_projects:
-                if proj == 'cminds':
+                # Skip generic directories
+                if proj.lower() in ('users', 'home', 'root'):
                     continue
                 proj_norm = proj.replace('-', '').replace('.loc', '').replace('.local', '')
                 if tag_lower == proj_norm or tag_lower in proj_norm or proj_norm in tag_lower:

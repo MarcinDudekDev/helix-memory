@@ -3,7 +3,7 @@
 Complete query documentation for Claude Code's memory system.
 
 ## Query Location
-`/Users/cminds/Tools/helix-memory/db/queries.hx`
+`db/queries.hx` (in the helix-memory repo root)
 
 ## Query Syntax Basics
 
@@ -509,7 +509,7 @@ Store frequently-used context IDs to avoid `GetAllContexts()` calls.
 **Connection Failed:**
 - Error: Cannot connect to database
 - Cause: DB not running
-- Fix: `/Users/cminds/.local/bin/helix push dev`
+- Fix: `helix push dev`
 
 ## Future Queries (Planned)
 
@@ -523,4 +523,4 @@ These queries are not yet implemented but planned:
 - `SearchMemoriesByTags(tag)` - Tag-based search
 - `GetRecentMemories(since_timestamp)` - Time-based filter
 
-To add these, edit `/Users/cminds/Tools/helix-memory/db/queries.hx` and rebuild.
+To add these, edit `db/queries.hx` and rebuild with `helix push dev`.

@@ -153,7 +153,7 @@ def detect_project(cwd: str) -> str:
     # Priority 2: Extract from path (most reliable for unregistered projects)
     SKIP_DIRS = {'wordpress', 'wp-content', 'plugins', 'themes', 'Sites',
                  'Tools', 'Projects', 'PycharmProjects', 'Documents', 'Praca',
-                 'Users', 'cminds', 'hooks', 'src', 'lib', 'node_modules',
+                 'Users', 'home', 'hooks', 'src', 'lib', 'node_modules',
                  '.wp-test', 'sites', 'Fiverr', '_WLASNE_'}
 
     parts = cwd.split('/')
@@ -202,11 +202,17 @@ def check_helix_running() -> bool:
 def try_restart_helix() -> bool:
     """Attempt to restart HelixDB if it's not running."""
     import subprocess
+    import shutil
     print("INFO: Attempting to restart HelixDB...", file=sys.stderr)
     try:
+        # Find helix binary
+        helix_bin = os.environ.get("HELIX_BIN") or shutil.which("helix") or str(Path.home() / ".local/bin/helix")
+        # Find helix-memory directory (parent of hooks/)
+        helix_dir = Path(__file__).parent.parent
+
         result = subprocess.run(
-            ["/Users/cminds/.local/bin/helix", "start", "dev"],
-            cwd="/Users/cminds/Tools/helix-memory",
+            [helix_bin, "start", "dev"],
+            cwd=str(helix_dir),
             capture_output=True,
             text=True,
             timeout=30

@@ -396,7 +396,7 @@ def cmd_status(args):
                 print(f"  {cat}: {count}")
     else:
         print("HelixDB: NOT RUNNING")
-        print("Start with: cd /Users/cminds/Tools/helix-memory && helix push dev")
+        print("Start with: memory start")
         sys.exit(1)
 
 def main():
