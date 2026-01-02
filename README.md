@@ -81,11 +81,6 @@ $MEMORY remember "User prefers FastAPI"    # Quick store with auto-categorizatio
 $MEMORY store "content" -t fact -i 8       # Store with explicit category
 $MEMORY delete abc123                      # Delete by ID
 $MEMORY tag "wordpress"                    # Find by tag
-
-# Reports
-$MEMORY plog                    # Today's work by project
-$MEMORY plog --days 7           # Last 7 days
-$MEMORY plog --month 2025-01    # Full month
 ```
 
 ### In Claude Code

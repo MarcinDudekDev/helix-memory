@@ -4,7 +4,7 @@ description: Long-term memory system for Claude Code using HelixDB graph-vector 
 domain: memory
 type: system
 frequency: daily
-commands: [memory, plog, recall]
+commands: [memory, recall]
 ---
 
 # Helix Memory - Long-Term Memory for Claude Code
@@ -276,20 +276,12 @@ memory delete <memory-id>
 memory tag "tagname"
 memory help
 
-# Project Log (Technical task reports)
-memory plog                              # Today's work by project
-memory plog --date 2025-12-21            # Specific date
-memory plog --month 2025-12              # Full month summary
-memory plog --month 2025-12 --project X  # Filter by project
-memory plog --days 7                     # Last N days
 ```
 
 ## Project Tagging
 
-Memories are **automatically tagged with project names** based on working directory:
-- Project detection uses `p --list` registry + directory name fallback
-- Project tag is prepended to all memory tags
-- Use `plog` to query work by project/date
+Memories are **automatically tagged with project names** based on working directory.
+Project detection uses directory name as fallback.
 
 ## Ollama Setup (For Real Semantic Search)
 

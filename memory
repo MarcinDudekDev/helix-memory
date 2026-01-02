@@ -14,7 +14,6 @@
 #   tag <tag>           Find memories by tag
 #   recall <topic>      Alias for search (natural language)
 #   remember <content>  Quick store with auto-categorization
-#   project-log         Technical project/task log (opposite of devlog)
 #   show <id>           Show memory details by ID
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
@@ -133,10 +132,6 @@ case "$1" in
         shift
         python3 "$HELPER" search "$*"
         ;;
-    project-log|plog)
-        shift
-        python3 "$SCRIPT_DIR/project_log.py" "$@"
-        ;;
     show)
         shift
         if [ -z "$1" ]; then
@@ -184,13 +179,6 @@ Memory Commands:
   recall, r <topic>       Search memories (alias)
   remember, rem <text>    Quick store with auto-categorization
   show <id>               Show memory details by ID
-
-Reports:
-  project-log, plog       Technical project/task log
-    --date YYYY-MM-DD     Specific date
-    --month YYYY-MM       Full month summary
-    --project NAME        Filter by project
-    --days N              Look back N days
 
 Examples:
   memory start            # Start HelixDB (starts Docker if needed)
