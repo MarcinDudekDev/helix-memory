@@ -40,7 +40,7 @@ def _get_config(section: str, key: str, default: str = "") -> str:
 
 # HelixDB configuration
 HELIX_URL = _get_config("helix", "url", "http://localhost:6969")
-HELIX_DATA_DIR = _get_config("helix", "data_dir", str(Path.home() / "Tools/helix-memory"))
+HELIX_DATA_DIR = _get_config("helix", "data_dir", str(Path.home() / ".claude/skills/helix-memory"))
 HELIX_BIN = _get_config("paths", "helix_bin", str(Path.home() / ".local/bin/helix"))
 CACHE_DIR = Path(_get_config("paths", "cache_dir", str(Path.home() / ".cache/helix-memory")))
 P_TOOL = _get_config("tools", "p_tool", "")
