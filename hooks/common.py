@@ -7,13 +7,44 @@ Enhanced with real embeddings, time-windows, and reasoning chains.
 import json
 import os
 import requests
+import configparser
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta
 import sys
 
+# ============================================================================
+# CONFIGURATION LOADING
+# ============================================================================
+
+def _load_config() -> configparser.ConfigParser:
+    """Load configuration from ~/.helix-memory.conf if it exists."""
+    config = configparser.ConfigParser()
+    config_path = Path.home() / ".helix-memory.conf"
+    if config_path.exists():
+        config.read(config_path)
+    return config
+
+_CONFIG = _load_config()
+
+def _get_config(section: str, key: str, default: str = "") -> str:
+    """Get config value with fallback to default."""
+    try:
+        value = _CONFIG.get(section, key)
+        # Expand ~ in paths
+        if value.startswith("~"):
+            value = str(Path(value).expanduser())
+        return value
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        return default
+
 # HelixDB configuration
-HELIX_URL = "http://localhost:6969"
+HELIX_URL = _get_config("helix", "url", "http://localhost:6969")
+HELIX_DATA_DIR = _get_config("helix", "data_dir", str(Path.home() / "Tools/helix-memory"))
+HELIX_BIN = _get_config("paths", "helix_bin", str(Path.home() / ".local/bin/helix"))
+CACHE_DIR = Path(_get_config("paths", "cache_dir", str(Path.home() / ".cache/helix-memory")))
+P_TOOL = _get_config("tools", "p_tool", "")
+H_TOOL = _get_config("tools", "h_tool", "")
 
 # Embedding configuration
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -103,9 +134,16 @@ def get_known_projects() -> Dict[str, str]:
 
     import subprocess
     projects = {}
+
+    # Use p_tool from config, or skip if not configured
+    p_tool_path = P_TOOL or str(Path.home() / 'Tools' / 'p')
+    if not Path(p_tool_path).exists():
+        _known_projects_cache = projects
+        return projects
+
     try:
         result = subprocess.run(
-            [str(Path.home() / 'Tools' / 'p'), '--list'],
+            [p_tool_path, '--list'],
             capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
@@ -153,7 +191,7 @@ def detect_project(cwd: str) -> str:
     # Priority 2: Extract from path (most reliable for unregistered projects)
     SKIP_DIRS = {'wordpress', 'wp-content', 'plugins', 'themes', 'Sites',
                  'Tools', 'Projects', 'PycharmProjects', 'Documents', 'Praca',
-                 'Users', 'home', 'hooks', 'src', 'lib', 'node_modules',
+                 'Users', 'cminds', 'hooks', 'src', 'lib', 'node_modules',
                  '.wp-test', 'sites', 'Fiverr', '_WLASNE_'}
 
     parts = cwd.split('/')
@@ -202,17 +240,11 @@ def check_helix_running() -> bool:
 def try_restart_helix() -> bool:
     """Attempt to restart HelixDB if it's not running."""
     import subprocess
-    import shutil
     print("INFO: Attempting to restart HelixDB...", file=sys.stderr)
     try:
-        # Find helix binary
-        helix_bin = os.environ.get("HELIX_BIN") or shutil.which("helix") or str(Path.home() / ".local/bin/helix")
-        # Find helix-memory directory (parent of hooks/)
-        helix_dir = Path(__file__).parent.parent
-
         result = subprocess.run(
-            [helix_bin, "start", "dev"],
-            cwd=str(helix_dir),
+            [HELIX_BIN, "start", "dev"],
+            cwd=HELIX_DATA_DIR,
             capture_output=True,
             text=True,
             timeout=30

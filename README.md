@@ -56,11 +56,38 @@ mkdir -p ~/.claude/skills/helix-memory
 cp -r skills/helix-memory/* ~/.claude/skills/helix-memory/
 ```
 
-3. Start HelixDB:
+3. (Optional) Create config file:
 ```bash
-cd ~/Tools/helix-memory
+cp .helix-memory.conf.example ~/.helix-memory.conf
+# Edit paths as needed
+```
+
+4. Start HelixDB:
+```bash
+cd ~/helix-memory  # or wherever you cloned it
 helix push dev
 ```
+
+## Configuration
+
+Helix Memory reads settings from `~/.helix-memory.conf` if it exists:
+
+```ini
+[helix]
+url = http://localhost:6969
+data_dir = ~/helix-memory
+
+[paths]
+helix_bin = ~/.local/bin/helix
+cache_dir = ~/.cache/helix-memory
+
+[tools]
+# Optional external tools
+p_tool =
+h_tool =
+```
+
+All values have sensible defaults - the config file is optional.
 
 ## Usage
 
