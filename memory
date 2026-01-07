@@ -116,25 +116,79 @@ case "$1" in
         shift
         if [ -z "$1" ]; then
             echo "Usage: memory store <content> [-t category] [-i importance] [-g tags]"
+            echo "  Arguments can be in any order. Use -- before content starting with -"
+            echo "  Examples:"
+            echo "    memory store \"user prefers X\" -t preference -i 8"
+            echo "    memory store -t fact -i 7 \"API key in .env\""
+            echo "    memory store -- \"-weird content\" -t fact"
             exit 1
         fi
-        # Check if explicit flags provided
-        has_flags=false
-        for arg in "$@"; do
-            case "$arg" in
-                -t|-i|-g|--category|--importance|--tags) has_flags=true; break ;;
+
+        # Robust argument parsing - accepts any order
+        content="" category="" importance="" tags=""
+        auto_categorize=true
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -c|--content)
+                    if [[ -n "$2" && "$2" != -* ]]; then
+                        content="$2"; shift 2
+                    else
+                        echo "Error: -c/--content requires a value"; exit 1
+                    fi
+                    ;;
+                -t|--category)
+                    if [[ -n "$2" && "$2" != -* ]]; then
+                        category="$2"; auto_categorize=false; shift 2
+                    else
+                        echo "Error: -t/--category requires a value"; exit 1
+                    fi
+                    ;;
+                -i|--importance)
+                    if [[ -n "$2" && "$2" != -* ]]; then
+                        importance="$2"; auto_categorize=false; shift 2
+                    else
+                        echo "Error: -i/--importance requires a value"; exit 1
+                    fi
+                    ;;
+                -g|--tags)
+                    if [[ -n "$2" && "$2" != -* ]]; then
+                        tags="$2"; shift 2
+                    else
+                        echo "Error: -g/--tags requires a value"; exit 1
+                    fi
+                    ;;
+                --)
+                    # Everything after -- is content
+                    shift
+                    content="$*"
+                    break
+                    ;;
+                -*)
+                    echo "Unknown flag: $1"
+                    echo "Valid flags: -c (content), -t (category), -i (importance), -g (tags)"
+                    exit 1
+                    ;;
+                *)
+                    # Non-flag argument = content
+                    if [ -z "$content" ]; then
+                        content="$1"
+                    else
+                        content="$content $1"
+                    fi
+                    shift
+                    ;;
             esac
         done
-        if $has_flags; then
-            # Explicit flags: pass through to store
-            if [[ "$1" == "-c" || "$1" == "--content" ]]; then
-                python3 "$HELPER" store "$@"
-            else
-                python3 "$HELPER" store -c "$@"
-            fi
-        else
-            # No flags: auto-categorize (same as remember)
-            content="$*"
+
+        if [ -z "$content" ]; then
+            echo "Error: content is required"
+            echo "Usage: memory store <content> [-t category] [-i importance] [-g tags]"
+            exit 1
+        fi
+
+        # Auto-categorize if no explicit flags provided
+        if $auto_categorize; then
             echo "Analyzing memory..."
             json=$(python3 "$HELPER" categorize "$content" 2>/dev/null)
             if [ -n "$json" ] && command -v jq >/dev/null; then
@@ -148,8 +202,16 @@ case "$1" in
             else
                 category="fact"; importance=5; tags=""
             fi
-            python3 "$HELPER" store -c "$content" -t "$category" -i "$importance" -g "$tags" --force
         fi
+
+        # Build command with normalized arguments
+        cmd=(python3 "$HELPER" store --content "$content")
+        [ -n "$category" ] && cmd+=(--category "$category")
+        [ -n "$importance" ] && cmd+=(--importance "$importance")
+        [ -n "$tags" ] && cmd+=(--tags "$tags")
+        cmd+=(--force)
+
+        "${cmd[@]}"
         ;;
     delete|del|rm)
         shift
