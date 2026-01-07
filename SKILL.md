@@ -15,14 +15,27 @@ Store and retrieve persistent memory across sessions using HelixDB's graph-vecto
 
 **ALWAYS use the `memory` bash script** - never call Python scripts directly.
 
-The `memory` script is located in the helix-memory repo root. After installation, use it directly or via alias:
+### Whitelisting
+
+The memory CLI is **globally whitelisted** via symlink:
+```
+~/Tools/memory → ~/.claude/skills/helix-memory/memory
+```
+
+Whitelist pattern in settings.json:
+```json
+"Bash(~/Tools/memory:*)"
+```
+
+This means:
+- All memory commands run **without permission prompts**
+- Agents inherit this whitelist
+- Use `~/Tools/memory` (shorter = fewer tokens)
+
+### Usage
 
 ```bash
-# Direct path (update to your install location)
-/path/to/helix-memory/memory <command>
-
-# Or if you set up an alias
-memory <command>
+~/Tools/memory <command>
 ```
 
 ## Service Commands (Start/Stop)
@@ -50,10 +63,13 @@ memory search "topic"
 # List all (sorted by importance)
 memory list --limit 10
 
-# Quick store with auto-categorization (uses Ollama/Gemini)
+# Store (all aliases work identically - auto-categorize by default)
+memory store "User prefers FastAPI over Flask"
+memory add "User prefers FastAPI over Flask"
 memory remember "User prefers FastAPI over Flask"
+memorize "User prefers FastAPI over Flask"
 
-# Store with explicit category
+# Store with explicit flags (skips auto-categorization)
 memory store "content" -t preference -i 9 -g "tags"
 
 # Delete by ID (prefix OK)
@@ -270,12 +286,11 @@ memory status     # Check status and memory count
 # Memory operations
 memory search "pytest"
 memory list --limit 10
-memory remember "User prefers pytest over unittest"
-memory store "content" -t category -i importance -g "tags"
+memory store/add/remember/rem "content"  # All auto-categorize
+memory store "content" -t cat -i imp -g "tags"  # Explicit flags
 memory delete <memory-id>
 memory tag "tagname"
 memory help
-
 ```
 
 ## Project Tagging

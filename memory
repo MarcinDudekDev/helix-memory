@@ -112,18 +112,43 @@ case "$1" in
         shift
         python3 "$HELPER" list "$@"
         ;;
-    store)
+    store|add)
         shift
         if [ -z "$1" ]; then
             echo "Usage: memory store <content> [-t category] [-i importance] [-g tags]"
             exit 1
         fi
-        # If first arg is -c or --content, pass through as-is (user provided flag)
-        # Otherwise, add -c prefix for positional content
-        if [[ "$1" == "-c" || "$1" == "--content" ]]; then
-            python3 "$HELPER" store "$@"
+        # Check if explicit flags provided
+        has_flags=false
+        for arg in "$@"; do
+            case "$arg" in
+                -t|-i|-g|--category|--importance|--tags) has_flags=true; break ;;
+            esac
+        done
+        if $has_flags; then
+            # Explicit flags: pass through to store
+            if [[ "$1" == "-c" || "$1" == "--content" ]]; then
+                python3 "$HELPER" store "$@"
+            else
+                python3 "$HELPER" store -c "$@"
+            fi
         else
-            python3 "$HELPER" store -c "$@"
+            # No flags: auto-categorize (same as remember)
+            content="$*"
+            echo "Analyzing memory..."
+            json=$(python3 "$HELPER" categorize "$content" 2>/dev/null)
+            if [ -n "$json" ] && command -v jq >/dev/null; then
+                category=$(echo "$json" | jq -r '.category // "fact"')
+                importance=$(echo "$json" | jq -r '.importance // 5')
+                tags=$(echo "$json" | jq -r '.tags // ""')
+            elif [ -n "$json" ]; then
+                category=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('category','fact'))" 2>/dev/null || echo "fact")
+                importance=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('importance',5))" 2>/dev/null || echo "5")
+                tags=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tags',''))" 2>/dev/null || echo "")
+            else
+                category="fact"; importance=5; tags=""
+            fi
+            python3 "$HELPER" store -c "$content" -t "$category" -i "$importance" -g "$tags" --force
         fi
         ;;
     delete|del|rm)
@@ -148,25 +173,37 @@ case "$1" in
             echo "Usage: memory show <memory-id>"
             exit 1
         fi
-        python3 "$HELPER" search "$1"
+        python3 "$HELPER" show "$1"
         ;;
     remember|rem)
+        # Alias for store (same behavior)
         shift
-        content="$*"
-        if [ -z "$content" ]; then
-            echo "Usage: memory remember <what to remember>"
-            exit 1
-        fi
-        echo "Analyzing memory (using Ollama if available, Haiku fallback)..."
-        json=$(python3 "$HELPER" categorize "$content" 2>/dev/null)
-        if [ -n "$json" ]; then
-            category=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('category','fact'))" 2>/dev/null || echo "fact")
-            importance=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('importance',5))" 2>/dev/null || echo "5")
-            tags=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tags',''))" 2>/dev/null || echo "")
-            python3 "$HELPER" store -c "$content" -t "$category" -i "$importance" -g "$tags" --force
-        else
-            python3 "$HELPER" store -c "$content" -t fact -i 5 --force
-        fi
+        exec "$0" store "$@"
+        ;;
+    health)
+        shift
+        python3 "$HELPER" health "$@"
+        ;;
+    garbage)
+        shift
+        python3 "$HELPER" garbage "$@"
+        ;;
+    link)
+        shift
+        python3 "$HELPER" link "$@"
+        ;;
+    merge)
+        shift
+        python3 "$HELPER" merge "$@"
+        ;;
+    curate)
+        shift
+        # Support: curate, curate analyze, curate review, curate apply
+        python3 "$HELPER" curate "$@"
+        ;;
+    dedup)
+        shift
+        python3 "$HELPER" dedup "$@"
         ;;
     help|--help|-h)
         cat << 'EOF'
@@ -183,21 +220,28 @@ Service Commands:
 Memory Commands:
   search, s <query>       Search memories by content
   list, ls [--limit N]    List all memories (sorted by importance)
-  store <content>         Store memory (-t category -i importance -g tags)
+  store/add/remember/rem  Store memory (auto-categorizes; optional: -t -i -g)
   delete, rm <id>         Delete memory by ID (prefix matching OK)
   tag <tag>               Find memories by tag
   recall, r <topic>       Search memories (alias)
-  remember, rem <text>    Quick store with auto-categorization
   show <id>               Show memory details by ID
+
+Curation Commands:
+  health [-v] [-t]        Memory health report (-t for thorough vector analysis)
+  garbage [-n] [-f]       Find/delete garbage memories (-n dry-run, -f force)
+  dedup [-n] [-f]         Find/delete duplicates
+  link <from> <to> [-r]   Create edge between memories
+  merge <keep> <del...>   Merge duplicates (keep one, delete rest)
+  curate [analyze]        Analyze memories, save pending actions (background-safe)
+  curate review           Show pending curation actions
+  curate apply            Execute pending actions (--links-only, --deletes-only, --merges-only)
 
 Examples:
   memory start            # Start HelixDB (starts Docker if needed)
-  memory stop             # Stop HelixDB
-  memory status
-  memory search "pytest"
-  memory list --limit 10
-  memory remember "User prefers FastAPI over Flask"
-  memory delete abc123
+  memory health -v        # Detailed health report
+  memory garbage --dry-run # Preview garbage without deleting
+  memory merge abc123 def456 ghi789  # Keep abc, delete def+ghi
+  memory link 1f0c60d1 1f0dc0ac -r related  # Link two memories
 
 Categories: preference, fact, context, decision, task, solution
 EOF
