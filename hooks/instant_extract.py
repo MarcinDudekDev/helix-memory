@@ -38,9 +38,11 @@ PATTERNS = {
         r'(https?://[^\s<>"\')\]]+)',
         r'(localhost:\d{2,5}[^\s<>"\')\]]*)',
     ],
-    # Inline memory markers from Claude
+    # Inline memory markers from Claude (visible blockquote format)
+    # Matches: > 💾 **category**: content
     "marker": [
-        r'<!--\s*MEM:\s*(\w+)\s*\|\s*(.+?)\s*-->',
+        r'>\s*💾\s*\*\*(\w+)\*\*:\s*(.+?)(?:\n|$)',
+        r'<!--\s*MEM:\s*(\w+)\s*\|\s*(.+?)\s*-->',  # Legacy hidden format
     ],
 }
 
@@ -121,13 +123,13 @@ def extract_inline_markers(text: str) -> List[Dict]:
             category = match.group(1).lower()
             content = match.group(2).strip()
 
-            # Validate category
-            valid_categories = {"preference", "fact", "path", "url", "credential", "decision", "context"}
+            # Validate category (matches CLAUDE.md)
+            valid_categories = {"preference", "fact", "decision", "solution", "credential"}
             if category not in valid_categories:
                 category = "fact"
 
             # Importance based on category
-            importance_map = {"preference": 8, "decision": 8, "credential": 9, "fact": 6, "context": 5}
+            importance_map = {"preference": 8, "decision": 8, "solution": 7, "credential": 9, "fact": 6}
             importance = importance_map.get(category, 6)
 
             results.append({
@@ -289,30 +291,32 @@ def process_exchange(user_msg: str, assistant_msg: str, project: str = "") -> Tu
 
 
 if __name__ == "__main__":
-    # Test mode
-    import argparse
+    import json
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--test", action="store_true", help="Run test extraction")
-    args = parser.parse_args()
+    # Read hook input from stdin
+    try:
+        data = json.load(sys.stdin)
+    except:
+        sys.exit(0)  # No input, exit silently
 
-    if args.test:
-        test_user = """
-        The project is at ~/Sites/level2-academy and uses FastAPI.
-        Always use pytest for testing. I prefer Datastar over React.
-        """
+    # Get last assistant message
+    assistant_msg = ""
+    for msg in reversed(data.get("messages", [])):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                assistant_msg = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            else:
+                assistant_msg = str(content)
+            break
 
-        test_assistant = """
-        Got it! I'll work with the project at ~/Sites/level2-academy.
+    if not assistant_msg:
+        sys.exit(0)
 
-        I found the config at ~/Sites/my-project/config.py
-        The API is running at localhost:8000
-
-        <!-- MEM: preference | User strongly prefers Datastar for frontend -->
-        <!-- MEM: fact | level2-academy uses FastAPI with pytest -->
-        """
-
-        extracts = extract_all(test_user, test_assistant, "level2-academy")
-        print("Extracted:")
-        for e in extracts:
-            print(f"  [{e['category']}] {e['content']}")
+    # Extract only inline markers (visible format)
+    extracts = extract_inline_markers(assistant_msg)
+    if extracts:
+        project = data.get("cwd", "").split("/")[-1]
+        stored = store_extracts(extracts, project)
+        if stored:
+            print(f"[instant] +{stored} memories", file=sys.stderr)
