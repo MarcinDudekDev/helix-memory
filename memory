@@ -112,6 +112,10 @@ case "$1" in
         shift
         python3 "$HELPER" list "$@"
         ;;
+    projects)
+        shift
+        python3 "$HELPER" projects "$@"
+        ;;
     store|add)
         shift
         if [ -z "$1" ]; then
@@ -281,7 +285,14 @@ Service Commands:
 
 Memory Commands:
   search, s <query>       Search memories by content
-  list, ls [--limit N]    List all memories (sorted by importance)
+  list, ls [options]      List all memories (sorted by importance)
+    --limit N               Limit to N results
+    --since DATE            Show memories after DATE (yesterday, 2026-01-10, "3 days ago")
+    --date DATE             Show memories on exact DATE
+  projects [options]      List projects worked on (cross-refs with p --list)
+    --since DATE            Show since DATE (default: yesterday)
+    --date DATE             Show on exact DATE
+    -v                      Show memory snippets
   store/add/remember/rem  Store memory (auto-categorizes; optional: -t -i -g)
   delete, rm <id>         Delete memory by ID (prefix matching OK)
   tag <tag>               Find memories by tag
