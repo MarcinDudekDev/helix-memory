@@ -28,7 +28,9 @@ from hooks.common import (
     contextual_search,
     detect_environment_from_path,
     link_memory_to_environment,
-    HELIX_URL
+    HELIX_URL,
+    VALID_CATEGORIES,
+    normalize_category,
 )
 import requests
 import os
@@ -568,7 +570,7 @@ def is_corrupted(content: str) -> bool:
     content = content.strip()
     if len(content) < 20:
         return True
-    if content.startswith(('[@', '[?', '</', '`)', '...')):
+    if content.startswith(('@', '[?', '</', '`)', '...')):
         return True
     if content.count('<bash') != content.count('</bash'):
         return True
@@ -1286,6 +1288,102 @@ def cmd_curate(args):
     print(f"Next: 'curate review' to inspect, 'curate apply' to execute")
 
 
+def cmd_migrate(args):
+    """
+    Migrate memories with invalid categories to valid ones.
+
+    Shows all memories that have categories not in VALID_CATEGORIES,
+    displays the mapping that would be applied, and with --apply
+    actually updates them.
+    """
+    if not check_helix_running():
+        print("ERROR: HelixDB not running", file=sys.stderr)
+        sys.exit(1)
+
+    memories = get_all_memories()
+    print(f"Scanning {len(memories)} memories for invalid categories...\n")
+
+    # Find memories with invalid categories
+    invalid = []
+    for m in memories:
+        cat = m.get('category', '')
+        cat_lower = cat.lower() if cat else ''
+        if cat_lower not in VALID_CATEGORIES:
+            new_cat = normalize_category(cat)
+            invalid.append({
+                'memory': m,  # Keep full memory object
+                'old_category': cat,
+                'new_category': new_cat,
+            })
+
+    if not invalid:
+        print("All memories have valid categories!")
+        return
+
+    # Group by old -> new mapping for summary
+    mappings = {}
+    for item in invalid:
+        key = f"{item['old_category']} -> {item['new_category']}"
+        mappings[key] = mappings.get(key, 0) + 1
+
+    print(f"Found {len(invalid)} memories with invalid categories:\n")
+
+    print("Category mappings:")
+    for mapping, count in sorted(mappings.items(), key=lambda x: -x[1]):
+        print(f"  {mapping}: {count}")
+
+    print(f"\nExamples (first 10):")
+    for item in invalid[:10]:
+        content = item['memory'].get('content', '')[:60]
+        print(f"  [{item['old_category']} -> {item['new_category']}] {content}...")
+
+    if len(invalid) > 10:
+        print(f"  ... and {len(invalid) - 10} more")
+
+    if not args.apply:
+        print(f"\nDry run complete. Use --apply to migrate {len(invalid)} memories.")
+        return
+
+    # Apply migration
+    print(f"\nMigrating {len(invalid)} memories...")
+
+    success = 0
+    errors = 0
+
+    for item in invalid:
+        try:
+            mem = item['memory']
+            mem_id = mem.get('id')
+
+            # Store new memory with normalized category (full content)
+            new_id = store_memory(
+                content=mem.get('content', ''),
+                category=item['new_category'],
+                importance=mem.get('importance', 5),
+                tags=mem.get('tags', ''),
+                source="migration"
+            )
+
+            if new_id:
+                # Delete old memory
+                if delete_memory(mem_id):
+                    success += 1
+                    if args.verbose:
+                        print(f"  Migrated: {mem_id[:8]}... [{item['old_category']} -> {item['new_category']}]")
+                else:
+                    errors += 1
+                    print(f"  ERROR: Could not delete old memory {mem_id[:8]}", file=sys.stderr)
+            else:
+                errors += 1
+                print(f"  ERROR: Could not create new memory for {mem_id[:8]}", file=sys.stderr)
+
+        except Exception as e:
+            errors += 1
+            print(f"  ERROR migrating {mem.get('id', '?')[:8]}: {e}", file=sys.stderr)
+
+    print(f"\nMigration complete: {success} migrated, {errors} errors")
+
+
 def cmd_projects(args):
     """List projects worked on based on memory tags, cross-referenced with p --list."""
     import subprocess
@@ -1437,7 +1535,7 @@ def main():
     # store command
     store_parser = subparsers.add_parser('store', help='Store a new memory')
     store_parser.add_argument('--content', '-c', required=True, help='Memory content')
-    store_parser.add_argument('--category', '-t', default='fact', choices=['preference', 'fact', 'context', 'decision', 'task', 'solution'], help='Memory category')
+    store_parser.add_argument('--category', '-t', default='fact', choices=['preference', 'fact', 'context', 'decision', 'task', 'solution', 'problem'], help='Memory category')
     store_parser.add_argument('--importance', '-i', type=int, default=5, help='Importance 1-10')
     store_parser.add_argument('--tags', '-g', default='', help='Comma-separated tags')
     store_parser.add_argument('--force', '-f', action='store_true', help='Store even if similar exists')
@@ -1544,6 +1642,12 @@ def main():
     curate_parser.add_argument('--deletes-only', action='store_true', help='Apply only delete operations')
     curate_parser.add_argument('--merges-only', action='store_true', help='Apply only merge operations')
     curate_parser.set_defaults(func=cmd_curate)
+
+    # migrate command - fix invalid categories
+    migrate_parser = subparsers.add_parser('migrate', help='Migrate memories with invalid categories')
+    migrate_parser.add_argument('--apply', '-a', action='store_true', help='Actually apply the migration (default: dry run)')
+    migrate_parser.add_argument('--verbose', '-v', action='store_true', help='Show each migration')
+    migrate_parser.set_defaults(func=cmd_migrate)
 
     args = parser.parse_args()
 

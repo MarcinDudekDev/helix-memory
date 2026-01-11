@@ -52,10 +52,20 @@ GEMINI_EMBEDDING_MODEL = "text-embedding-004"  # 768 dims, free tier
 GEMINI_LLM_MODEL = "gemma-3-4b-it"  # 30 RPM, 14.4K RPD - instruction-tuned, high free limits
 EMBEDDING_DIM = 1536  # HelixDB was initialized with 1536 (OpenAI standard) - must match
 
-# Ollama config (for embeddings and LLM)
-OLLAMA_URL = "http://localhost:11434"
+# Ollama config - detect remote GPU vs local at startup
+OLLAMA_REMOTE = "http://100.101.59.25:11434"  # RTX4070 PC via Tailscale
+OLLAMA_LOCAL = "http://localhost:11434"
 OLLAMA_MODEL = "nomic-embed-text"  # For embeddings
-OLLAMA_LLM_MODEL = os.environ.get("OLLAMA_LLM_MODEL", "llama3.2:3b")  # For text generation
+
+# Detect best Ollama server once at import
+def _detect_ollama():
+    try:
+        requests.get(f"{OLLAMA_REMOTE}/api/tags", timeout=2)
+        return OLLAMA_REMOTE, "llama3.1:8b", "remote-gpu"
+    except:
+        return OLLAMA_LOCAL, "llama3.2:3b", "local"
+
+OLLAMA_URL, OLLAMA_LLM_MODEL, OLLAMA_SOURCE = _detect_ollama()
 
 # LLM provider preference: "ollama" (free, local) or "haiku" (Claude API)
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")  # Default to Ollama when available
@@ -67,6 +77,64 @@ TIME_WINDOWS = {
     "deep": 2160,      # Last 90 days - thorough
     "full": None       # All time
 }
+
+# Valid memory categories (per schema + problem)
+VALID_CATEGORIES = {"preference", "fact", "context", "decision", "task", "solution", "problem"}
+
+# Category normalization mappings (invalid -> valid)
+CATEGORY_MAPPINGS = {
+    # Preference variants
+    "user preference": "preference",
+
+    # Fact variants
+    "insight": "fact",
+    "benefit": "fact",
+    "inconsistency": "fact",
+    "credential": "fact",
+    "path": "fact",
+    "url": "fact",
+
+    # Solution variants
+    "feature": "solution",
+    "problem solved": "solution",
+    "solution proposal": "solution",
+
+    # Problem variants
+    "bug": "problem",
+    "problem identification": "problem",
+
+    # Task variants
+    "user request": "task",
+
+    # Decision variants
+    "workflow choice": "decision",
+}
+
+def normalize_category(category: str) -> str:
+    """
+    Normalize arbitrary category to valid schema category.
+
+    Args:
+        category: Raw category string from LLM or user
+
+    Returns:
+        Valid category from VALID_CATEGORIES
+    """
+    if not category:
+        return "fact"
+
+    cat = category.strip().lower()
+
+    # Already valid
+    if cat in VALID_CATEGORIES:
+        return cat
+
+    # Map known invalid categories
+    if cat in CATEGORY_MAPPINGS:
+        return CATEGORY_MAPPINGS[cat]
+
+    # Default fallback
+    return "fact"
 
 # Embedding cache (LRU-style, persisted per-process)
 _embedding_cache: Dict[str, Tuple[List[float], str]] = {}
@@ -460,11 +528,11 @@ def llm_generate(prompt: str, timeout: int = 60) -> Tuple[Optional[str], str]:
     PRIVACY: Ollama is preferred because it keeps all data local.
     Gemini is only used as fallback when Ollama unavailable.
     """
-    # Try Ollama first (local, keeps data private)
+    # Try Ollama first (remote GPU or local)
     if check_ollama_running():
         output = generate_with_ollama(prompt, timeout)
         if output:
-            return output, f"ollama/{OLLAMA_LLM_MODEL}"
+            return output, f"ollama/{OLLAMA_LLM_MODEL} ({OLLAMA_SOURCE})"
 
     # Fallback to Gemini Flash (free, but sends data externally)
     if GEMINI_API_KEY:
@@ -503,8 +571,63 @@ def extract_json_array(text: str) -> list:
 # MEMORY STORAGE
 # ============================================================================
 
+def _auto_link_problem_solution(memory_id: str, content: str, category: str) -> int:
+    """
+    Auto-link problems to solutions and vice versa.
+
+    When storing a problem, finds related solutions and creates bidirectional edges.
+    When storing a solution, finds related problems and creates bidirectional edges.
+
+    Args:
+        memory_id: ID of the newly stored memory
+        content: Content of the memory for similarity search
+        category: "problem" or "solution"
+
+    Returns:
+        Number of edges created
+    """
+    target_category = "solution" if category == "problem" else "problem"
+
+    # Find semantically similar memories of the opposite category
+    related = search_by_similarity(content, k=5, window="full")
+
+    links_created = 0
+    for r in related:
+        if r.get("category") != target_category:
+            continue
+
+        related_id = r.get("id")
+        if not related_id:
+            continue
+
+        # Create bidirectional relationship
+        # problem -> solution = "solved_by"
+        # solution -> problem = "solves"
+        if category == "problem":
+            # This problem is solved by that solution
+            if link_related_memories(memory_id, related_id, "solved_by", 8):
+                links_created += 1
+            # That solution solves this problem
+            if link_related_memories(related_id, memory_id, "solves", 8):
+                links_created += 1
+        else:  # category == "solution"
+            # This solution solves that problem
+            if link_related_memories(memory_id, related_id, "solves", 8):
+                links_created += 1
+            # That problem is solved by this solution
+            if link_related_memories(related_id, memory_id, "solved_by", 8):
+                links_created += 1
+
+    if links_created > 0:
+        print(f"INFO: Auto-linked {links_created} problem-solution edges", file=sys.stderr)
+
+    return links_created
+
 def store_memory(content: str, category: str, importance: int, tags: str, source: str = "hook") -> Optional[str]:
     """Store a memory to HelixDB with full metadata including timestamp."""
+    # Normalize category to valid schema value
+    category = normalize_category(category)
+
     if not check_helix_running():
         return None
     try:
@@ -523,7 +646,16 @@ def store_memory(content: str, category: str, importance: int, tags: str, source
         )
         response.raise_for_status()
         result = response.json()
-        return result.get("memory", {}).get("id")
+        memory_id = result.get("memory", {}).get("id")
+
+        # Auto-link problems to solutions and vice versa
+        if memory_id and category in ("problem", "solution"):
+            try:
+                _auto_link_problem_solution(memory_id, content, category)
+            except Exception as e:
+                print(f"WARNING: Auto-linking failed: {e}", file=sys.stderr)
+
+        return memory_id
     except Exception as e:
         print(f"ERROR: Failed to store memory: {e}", file=sys.stderr)
         return None
@@ -1001,6 +1133,198 @@ def find_similar_memories(content: str, category: str = None, tags: str = None) 
                 similar.append(memory)
 
     return similar
+
+
+# ============================================================================
+# MEMORY LINKING & SYNTHESIS
+# ============================================================================
+
+def calculate_semantic_similarity(text1: str, text2: str) -> float:
+    """
+    Calculate semantic similarity between two texts using embeddings.
+    Returns value between 0 (unrelated) and 1 (identical).
+    Falls back to word overlap if embeddings unavailable.
+    """
+    import numpy as np
+
+    # Try embedding-based similarity first
+    try:
+        vec1, _ = generate_embedding(text1)
+        vec2, _ = generate_embedding(text2)
+
+        if vec1 and vec2:
+            # Cosine similarity
+            vec1 = np.array(vec1)
+            vec2 = np.array(vec2)
+            dot = np.dot(vec1, vec2)
+            norm1 = np.linalg.norm(vec1)
+            norm2 = np.linalg.norm(vec2)
+            if norm1 > 0 and norm2 > 0:
+                return float(dot / (norm1 * norm2))
+    except:
+        pass
+
+    # Fallback: word overlap (Jaccard similarity)
+    words1 = set(text1.lower().split())
+    words2 = set(text2.lower().split())
+    intersection = words1 & words2
+    union = words1 | words2
+    return len(intersection) / len(union) if union else 0
+
+
+def get_related_memories(memory_id: str) -> List[Dict]:
+    """Get memories linked via RelatesTo edge."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetRelatedMemories",
+            json={"memory_id": memory_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("related", [])
+    except:
+        return []
+
+
+def link_new_memory(memory_id: str, content: str, tags: str = "", threshold: float = 0.6) -> int:
+    """
+    After storing a memory, find and link related memories.
+
+    Returns number of edges created.
+
+    Strategy:
+    1. Find semantically similar memories
+    2. High similarity (>0.9) = potential duplicate, create Supersedes
+    3. Moderate similarity (>0.6) = related, create RelatesTo
+    4. Check for vague → specific patterns (details_in relationship)
+    """
+    if not check_helix_running():
+        return 0
+
+    edges_created = 0
+
+    # Find similar memories via hybrid search
+    similar = hybrid_search(content, k=10)
+
+    # Patterns indicating vague references
+    vague_patterns = [
+        "were provided", "was set", "is configured", "was created",
+        "has been", "was updated", "was added", "was changed"
+    ]
+
+    for existing in similar:
+        existing_id = existing.get("id", "")
+        if not existing_id or existing_id == memory_id:
+            continue
+
+        existing_content = existing.get("content", "")
+        similarity = calculate_semantic_similarity(content, existing_content)
+
+        # High similarity = potential duplicate or update
+        if similarity > 0.9:
+            # New memory supersedes old if more recent
+            if create_supersedes(memory_id, existing_id):
+                edges_created += 1
+                print(f"  → Supersedes: {existing_content[:40]}...", file=sys.stderr)
+
+        # Moderate similarity = related
+        elif similarity > threshold:
+            strength = int(similarity * 10)
+            if link_related_memories(memory_id, existing_id, "related", strength):
+                edges_created += 1
+
+            # Check if existing is vague and new provides details
+            if any(p in existing_content.lower() for p in vague_patterns):
+                # New memory might provide details for vague reference
+                if link_related_memories(existing_id, memory_id, "details_in", 8):
+                    edges_created += 1
+                    print(f"  → Details for: {existing_content[:40]}...", file=sys.stderr)
+
+    return edges_created
+
+
+def get_memory_with_links(memory_id: str) -> Dict:
+    """
+    Get a memory along with all linked context.
+
+    Returns memory dict with additional 'linked' field containing:
+    - related: memories via RelatesTo
+    - implies: memories via Implies
+    - details: memories that provide details for this one
+    - supersedes: memories this one supersedes
+    """
+    if not check_helix_running():
+        return {}
+
+    try:
+        # Get base memory
+        response = requests.post(
+            f"{HELIX_URL}/GetMemory",
+            json={"id": memory_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        memory = response.json().get("memory", {})
+
+        if not memory:
+            return {}
+
+        # Get linked memories
+        memory['linked'] = {
+            'related': get_related_memories(memory_id),
+            'implies': get_implications(memory_id),
+            'contradicts': get_contradictions(memory_id),
+        }
+
+        # Get memories where this one provides details
+        # (inverse of details_in relationship)
+        all_mems = get_all_memories()
+        details_for = []
+        for m in all_mems:
+            related = get_related_memories(m.get("id", ""))
+            for r in related:
+                if r.get("id") == memory_id:
+                    # This memory is related to m
+                    details_for.append(m)
+                    break
+        memory['linked']['details_for'] = details_for[:3]  # Limit
+
+        return memory
+    except:
+        return {}
+
+
+def format_memory_with_links(memory: Dict) -> str:
+    """Format a memory showing its connections."""
+    cat = memory.get("category", "unknown").upper()
+    content = memory.get("content", "")
+    output = f"[{cat}] {content}"
+
+    linked = memory.get("linked", {})
+
+    # Show details (most important for context)
+    if linked.get("related"):
+        details = [m for m in linked["related"]
+                   if "details" in str(m.get("relationship", ""))]
+        if details:
+            output += "\n  📎 Details:"
+            for d in details[:2]:
+                output += f"\n    → {d.get('content', '')[:60]}..."
+
+    # Show related
+    related = [m for m in linked.get("related", [])
+               if "details" not in str(m.get("relationship", ""))]
+    if related:
+        output += "\n  🔗 Related:"
+        for r in related[:2]:
+            output += f"\n    ↔ {r.get('content', '')[:50]}..."
+
+    return output
+
 
 # ============================================================================
 # CONTEXT MANAGEMENT

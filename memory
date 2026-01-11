@@ -116,6 +116,10 @@ case "$1" in
         shift
         python3 "$HELPER" projects "$@"
         ;;
+    migrate)
+        shift
+        python3 "$HELPER" migrate "$@"
+        ;;
     store|add)
         shift
         if [ -z "$1" ]; then
