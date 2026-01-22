@@ -72,11 +72,20 @@ memorize "User prefers FastAPI over Flask"
 # Store with explicit flags (skips auto-categorization)
 memory store "content" -t preference -i 9 -g "tags"
 
+# Store solution with link to problem
+memory store "Fix: use async/await" -t solution --solves abc123
+
 # Delete by ID (prefix OK)
 memory delete abc123
 
 # Find by tag
 memory tag "wordpress"
+
+# Show memory details with edges
+memory show abc123
+
+# Link memories (see Graph Relationships section)
+memory link <from_id> <to_id> --type solves
 
 # Help
 memory help
@@ -133,7 +142,26 @@ Combines vector similarity + text matching for best results:
 results = hybrid_search("python testing preferences", k=10, window="contextual")
 ```
 
-### 4. Reasoning Chains (Graph Power!)
+### 4. Problem-Solution Linking
+
+Link solutions to the problems they solve using the `--type solves` edge:
+
+```bash
+# Link existing memories
+memory link <solution_id> <problem_id> --type solves
+
+# Store solution with auto-link
+memory store "Fix: use async/await for DB calls" -t solution --solves <problem_id>
+```
+
+**3-Step Workflow for Problem-Solution Linking:**
+1. **Identify the problem** - Find/store the problem memory: `memory search "timeout error"`
+2. **Store/find the solution** - `memory store "Fix: use connection pooling" -t solution`
+3. **Link them** - `memory link <solution_id> <problem_id> --type solves`
+
+**View linked solutions:** `memory show <problem_id>` displays `--SOLVED BY--` section.
+
+### 5. Reasoning Chains (Graph Power!)
 Create logical relationships between memories:
 
 ```python
@@ -288,10 +316,64 @@ memory search "pytest"
 memory list --limit 10
 memory store/add/remember/rem "content"  # All auto-categorize
 memory store "content" -t cat -i imp -g "tags"  # Explicit flags
+memory store "solution" -t solution --solves <problem_id>  # Link solution to problem
 memory delete <memory-id>
 memory tag "tagname"
+memory show <memory-id>    # Show details with edges
 memory help
+
+# Graph operations (linking memories)
+memory link <from_id> <to_id> --type <edge_type>
 ```
+
+### Link Command & Edge Types
+
+The `memory link` command creates graph edges between memories:
+
+```bash
+memory link <from_id> <to_id> --type <edge_type>
+```
+
+**Available edge types:**
+
+| Edge Type | Direction | Use Case |
+|-----------|-----------|----------|
+| `solves` | solution → problem | Link a fix to the bug it solves |
+| `solved_by` | problem → solution | Link a bug to its fix |
+| `supersedes` | new → old | New preference replaces old |
+| `implies` | A → B | A logically implies B |
+| `contradicts` | A ↔ B | A and B conflict |
+| `leads_to` | cause → effect | Causal chain |
+| `supports` | evidence → claim | Supporting evidence |
+| `related` | A ↔ B | Generic relationship (default) |
+
+**Examples:**
+```bash
+# Solution solves a problem
+memory link sol_abc123 prob_def456 --type solves
+
+# New preference supersedes old
+memory link new_pref old_pref --type supersedes
+
+# One decision implies another
+memory link use_fastapi avoid_flask --type implies
+```
+
+### Show Command
+
+`memory show <id>` displays memory details and linked edges:
+
+```bash
+memory show abc123
+```
+
+Output includes relationship sections:
+- `--SOLVED BY--` - Solutions for problems
+- `--SOLVES--` - Problems solved by solutions
+- `--IMPLIES--` - Logical implications
+- `--CONTRADICTS--` - Conflicts
+- `--SUPERSEDES--` - Replaced memories
+- `--RELATED--` - Generic relationships
 
 ## Project Tagging
 

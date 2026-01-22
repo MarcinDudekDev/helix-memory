@@ -22,34 +22,24 @@ from common import store_memory, check_helix_running, ensure_helix_running, llm_
 def extract_memories(user_msg: str, assistant_msg: str, project: str) -> list:
     """Use LLM (Ollama or Gemini) to extract important memories from exchange."""
 
-    prompt = f'''Analyze this conversation exchange and extract ALL important memories worth storing long-term.
+    prompt = f'''Extract 1-3 facts worth remembering. NO preamble. Just JSON.
 
-RULES:
-1. Output in ENGLISH only (regardless of input language)
-2. Store HIGH-LEVEL SUMMARIES - no code snippets, no raw outputs
-3. Focus on: decisions made, problems solved, user preferences, important facts learned
-4. Skip: routine operations, file reads, trivial exchanges
+User: {user_msg[:1500]}
+Assistant: {assistant_msg[:3000]}
 
-Categories:
-- preference: User preferences, workflow choices (importance 8-10)
-- decision: Technical/architectural decisions (importance 7-9)
-- solution: Bug fixes, workarounds, completed tasks (importance 6-8)
-- fact: Learned information about tools, APIs, systems (importance 5-7)
-
-USER MESSAGE:
-{user_msg[:1500]}
-
-ASSISTANT RESPONSE:
-{assistant_msg[:3000]}
-
-Return ONLY a valid JSON array. Extract all genuinely important memories (not limited to 2).
-Format: [{{"content": "...", "category": "...", "importance": N, "tags": "{project}"}}]
-If nothing important, return: []'''
+Format: [{{"content": "fact sentence", "tags": "{project}"}}]'''
 
     output, provider = llm_generate(prompt, timeout=20)
     if output:
         print(f"Using LLM: {provider}", file=sys.stderr)
-        return extract_json_array(output)
+        # Try JSON first
+        memories = extract_json_array(output)
+        if memories:
+            return memories
+        # Fallback: if LLM returned plain text (not JSON), use it as one memory
+        clean = output.strip()
+        if len(clean) > 30 and not clean.startswith('['):
+            return [{"content": clean, "tags": project}]
 
     return []
 
@@ -96,11 +86,15 @@ def main():
             continue
         content = mem.get("content", "")
         if content and len(content) > 15:
+            # Convert tags to string (LLM may return array)
+            tags = mem.get("tags", args.project)
+            if isinstance(tags, list):
+                tags = ",".join(str(t) for t in tags)
             result = store_memory(
                 content,
                 mem.get("category", "fact"),
                 min(10, max(1, mem.get("importance", 5))),
-                mem.get("tags", args.project),
+                tags or args.project,
                 "scribe"
             )
             if result:

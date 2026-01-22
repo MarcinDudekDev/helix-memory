@@ -147,15 +147,21 @@ E::RelatesTo {
 ```
 
 **Properties:**
-- `relationship: String` - Type: "similar", "follows", "contradicts", "supersedes", "relates"
+- `relationship: String` - Type of edge (see table below)
 - `strength: U32` - Relationship strength (1-10)
 
 **Relationship Types:**
-- **similar**: Memories about related topics
-- **follows**: Sequential relationship (B follows A)
-- **contradicts**: Conflicting information
-- **supersedes**: Newer info replaces old
-- **relates**: Generic relationship
+
+| Type | Direction | Use Case |
+|------|-----------|----------|
+| `related` | A ↔ B | Generic relationship (default) |
+| `solves` | solution → problem | Link fix to bug |
+| `solved_by` | problem → solution | Link bug to fix |
+| `supersedes` | new → old | New replaces old |
+| `implies` | A → B | Logical implication |
+| `contradicts` | A ↔ B | Conflicting info |
+| `leads_to` | cause → effect | Causation |
+| `supports` | evidence → claim | Evidence |
 
 **Usage:**
 Create graph of related information for rich context retrieval.
@@ -166,6 +172,34 @@ from_memory <- N<Memory>(from_id)
 to_memory <- N<Memory>(to_id)
 AddE<RelatesTo>::From(from_memory)::To(to_memory)
 ```
+
+### E::Solves
+Connects solutions to problems they solve (causal fix relationship).
+
+**Structure:**
+```hx
+E::Solves {
+    From: Memory,  // solution
+    To: Memory,    // problem
+    Properties: {
+        strength: U32,      // 1-10 how directly it solves
+        verified: Boolean   // has fix been verified
+    }
+}
+```
+
+**Usage:**
+Link solution memories to problem memories.
+
+**CLI:**
+```bash
+memory link <solution_id> <problem_id> --type solves
+memory store "Fix: use pooling" -t solution --solves <problem_id>
+```
+
+**Display:**
+`memory show <problem_id>` displays `--SOLVED BY--` section.
+`memory show <solution_id>` displays `--SOLVES--` section.
 
 ## Type System
 
@@ -189,7 +223,9 @@ Memory (content, category, importance, tags)
   |
   ├─[BelongsTo]────> Context (project/session)
   |
-  └─[RelatesTo]────> Memory (related info)
+  ├─[RelatesTo]────> Memory (related info)
+  |
+  └─[Solves]───────> Memory (problem)  // solution → problem
 ```
 
 ## Schema Evolution

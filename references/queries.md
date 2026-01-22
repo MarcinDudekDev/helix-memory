@@ -160,21 +160,39 @@ Create relationship between two memories.
 ```hx
 QUERY LinkRelatedMemories(
     from_id: ID,
-    to_id: ID
+    to_id: ID,
+    relationship: String,  // optional
+    strength: U32          // optional
 ) => ...
 ```
 
 **Parameters:**
 - `from_id` - Source memory
 - `to_id` - Target memory
+- `relationship` - Edge type (see below)
+- `strength` - 1-10 strength rating
+
+**Available Edge Types:**
+| Type | Direction | Use Case |
+|------|-----------|----------|
+| `related` | A ↔ B | Generic relationship (default) |
+| `solves` | solution → problem | Link fix to bug |
+| `solved_by` | problem → solution | Link bug to fix |
+| `supersedes` | new → old | Replacement |
+| `implies` | A → B | Logical implication |
+| `contradicts` | A ↔ B | Conflict |
+| `leads_to` | cause → effect | Causation |
+| `supports` | evidence → claim | Evidence |
 
 **Returns:** "success"
 
 **Example Usage:**
 ```json
 {
-    "from_id": "mem_123",
-    "to_id": "mem_456"
+    "from_id": "sol_123",
+    "to_id": "prob_456",
+    "relationship": "solves",
+    "strength": 9
 }
 ```
 
@@ -183,8 +201,14 @@ QUERY LinkRelatedMemories(
 - Sequential decisions
 - Contradicting information
 - Superseding updates
+- **Problem-solution linking**
 
-**Relationship Types:** See schema.md for RelatesTo edge properties.
+**CLI Equivalent:**
+```bash
+memory link sol_123 prob_456 --type solves
+```
+
+**Relationship Types:** See schema.md for edge properties.
 
 ## Search Operations
 

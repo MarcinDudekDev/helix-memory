@@ -121,3 +121,13 @@ E::RelatesTo {
         strength: U32,
     }
 }
+
+// Solution solves a problem (causal fix relationship)
+// "Fixed datastar signal" SOLVES "Cart count not updating"
+E::Solves {
+    From: Memory,
+    To: Memory,
+    Properties: {
+        strength: U32,       // 1-10 how directly it solves the problem
+    }
+}

@@ -571,6 +571,76 @@ def extract_json_array(text: str) -> list:
 # MEMORY STORAGE
 # ============================================================================
 
+def _extract_problem_from_solution(content: str) -> Optional[str]:
+    """
+    Extract problem statement from solution content.
+
+    Looks for patterns like:
+    - "Fixed X by doing Y" → extracts "X"
+    - "Solved X with Y" → extracts "X"
+    - "Resolved X using Y" → extracts "X"
+    - "The issue was X" → extracts "X"
+    - "Problem: X" → extracts "X"
+
+    Args:
+        content: Solution content text
+
+    Returns:
+        Extracted problem statement or None if not found
+    """
+    import re
+
+    content_lower = content.lower()
+
+    # Patterns that indicate problem description follows
+    # Format: (regex_pattern, group_index_for_problem)
+    patterns = [
+        # "X using Y" patterns first (greedy to capture full phrase before "using")
+        (r'fixed\s+(.+)\s+using\s+', 1),
+        (r'solved\s+(.+)\s+using\s+', 1),
+        (r'resolved\s+(.+)\s+using\s+', 1),
+        # "Fixed X by/with/via Y" (non-greedy, for shorter matches)
+        (r'fixed\s+(.+?)\s+(?:by|with|via)\s+', 1),
+        (r'solved\s+(.+?)\s+(?:by|with|via)\s+', 1),
+        (r'resolved\s+(.+?)\s+(?:by|with|via)\s+', 1),
+        # "Fixed X" (at end or with period)
+        (r'fixed\s+([^.]+?)(?:\.|$)', 1),
+        # "Solved X" (at end or with period)
+        (r'solved\s+([^.]+?)(?:\.|$)', 1),
+        # "Resolved X" (at end or with period)
+        (r'resolved\s+([^.]+?)(?:\.|$)', 1),
+        # "The issue was X"
+        (r'the\s+issue\s+was\s+(.+?)(?:\.|$)', 1),
+        # "The problem was X"
+        (r'the\s+problem\s+was\s+(.+?)(?:\.|$)', 1),
+        # "Problem: X" or "Issue: X"
+        (r'(?:problem|issue):\s*(.+?)(?:\.|$)', 1),
+        # "Fix for X"
+        (r'fix\s+for\s+(.+?)(?:\.|$)', 1),
+        # "Solution for X"
+        (r'solution\s+for\s+(.+?)(?:\.|$)', 1),
+        # "To fix X"
+        (r'to\s+fix\s+(.+?)(?:,|\.|$)', 1),
+        # "Workaround for X"
+        (r'workaround\s+for\s+(.+?)(?:\.|$)', 1),
+    ]
+
+    for pattern, group_idx in patterns:
+        match = re.search(pattern, content_lower, re.IGNORECASE)
+        if match:
+            problem = match.group(group_idx).strip()
+            # Clean up and validate
+            if len(problem) > 10 and len(problem) < 500:
+                # Capitalize first letter, preserve rest
+                # Find the actual case from original content
+                start_pos = content_lower.find(problem)
+                if start_pos >= 0:
+                    problem = content[start_pos:start_pos + len(problem)]
+                return problem.strip()
+
+    return None
+
+
 def _auto_link_problem_solution(memory_id: str, content: str, category: str) -> int:
     """
     Auto-link problems to solutions and vice versa.
@@ -648,7 +718,42 @@ def store_memory(content: str, category: str, importance: int, tags: str, source
         result = response.json()
         memory_id = result.get("memory", {}).get("id")
 
-        # Auto-link problems to solutions and vice versa
+        # Auto-extract and store problem when storing a solution
+        if memory_id and category == "solution":
+            try:
+                problem_text = _extract_problem_from_solution(content)
+                if problem_text:
+                    # Store the extracted problem (lower importance, same tags)
+                    problem_id = None
+                    try:
+                        prob_response = requests.post(
+                            f"{HELIX_URL}/StoreMemory",
+                            json={
+                                "content": problem_text,
+                                "category": "problem",
+                                "importance": max(importance - 2, 5),  # Slightly lower importance
+                                "tags": tags,
+                                "source": f"{source}:auto-extracted",
+                                "created_at": datetime.now().isoformat()
+                            },
+                            headers={"Content-Type": "application/json"},
+                            timeout=10
+                        )
+                        prob_response.raise_for_status()
+                        problem_id = prob_response.json().get("memory", {}).get("id")
+                    except Exception as e:
+                        print(f"WARNING: Failed to store extracted problem: {e}", file=sys.stderr)
+
+                    # Link solution -> problem with "solves" relationship
+                    if problem_id:
+                        if link_related_memories(memory_id, problem_id, "solves", 9):
+                            print(f"INFO: Auto-created problem and linked: {problem_text[:50]}...", file=sys.stderr)
+                        # Also link problem -> solution with "solved_by"
+                        link_related_memories(problem_id, memory_id, "solved_by", 9)
+            except Exception as e:
+                print(f"WARNING: Problem extraction failed: {e}", file=sys.stderr)
+
+        # Auto-link problems to solutions and vice versa (finds EXISTING related memories)
         if memory_id and category in ("problem", "solution"):
             try:
                 _auto_link_problem_solution(memory_id, content, category)
@@ -698,6 +803,81 @@ def delete_memory(memory_id: str) -> bool:
     except Exception as e:
         print(f"ERROR: Failed to delete memory {memory_id}: {e}", file=sys.stderr)
         return False
+
+def update_memory_tags(memory_id: str, new_tags: str) -> bool:
+    """
+    Update tags on an existing memory.
+
+    Since HelixDB may not support direct property updates, this uses
+    the UpdateMemoryTags query if available, otherwise falls back to
+    fetch-delete-store pattern.
+
+    Args:
+        memory_id: Full memory ID
+        new_tags: New comma-separated tags string
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if not check_helix_running():
+        return False
+
+    # Try direct update first (if HelixDB supports it)
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/UpdateMemoryTags",
+            json={"memory_id": memory_id, "new_tags": new_tags},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        if response.status_code == 200:
+            return True
+    except Exception:
+        pass  # Fall through to fallback method
+
+    # Fallback: fetch memory, store new with updated tags, delete old
+    try:
+        # Get original memory
+        response = requests.post(
+            f"{HELIX_URL}/GetMemory",
+            json={"id": memory_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        original = response.json().get("memory", {})
+
+        if not original:
+            print(f"ERROR: Memory not found: {memory_id}", file=sys.stderr)
+            return False
+
+        # Store new memory with updated tags
+        new_id = store_memory(
+            content=original.get("content", ""),
+            category=original.get("category", "fact"),
+            importance=original.get("importance", 5),
+            tags=new_tags,
+            source=original.get("source", "retag")
+        )
+
+        if new_id:
+            # Delete old memory
+            if delete_memory(memory_id):
+                print(f"INFO: Retagged memory {memory_id[:8]}... -> {new_id[:8]}...", file=sys.stderr)
+                return True
+            else:
+                # Rollback: delete new memory if old deletion failed
+                delete_memory(new_id)
+                print(f"ERROR: Failed to delete old memory during retag", file=sys.stderr)
+                return False
+        else:
+            print(f"ERROR: Failed to create new memory during retag", file=sys.stderr)
+            return False
+
+    except Exception as e:
+        print(f"ERROR: Failed to update memory tags: {e}", file=sys.stderr)
+        return False
+
 
 def deactivate_memory(memory_id: str) -> bool:
     """Soft-delete a memory (mark inactive)."""
@@ -1048,6 +1228,77 @@ def create_supersedes(new_id: str, old_id: str) -> bool:
         print(f"ERROR: Failed to create supersedes: {e}", file=sys.stderr)
         return False
 
+def create_solves_link(solution_id: str, problem_id: str, strength: int = 8) -> bool:
+    """Create SOLVES relationship (solution -> problem).
+
+    Tries the dedicated CreateSolvesLink endpoint first, falls back to
+    generic LinkRelatedMemories if the specific endpoint doesn't exist yet.
+    """
+    if not check_helix_running():
+        return False
+    try:
+        # Try dedicated endpoint first
+        response = requests.post(
+            f"{HELIX_URL}/CreateSolvesLink",
+            json={"solution_id": solution_id, "problem_id": problem_id, "strength": strength},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            # Endpoint doesn't exist yet, fall back to generic RelatesTo edge
+            try:
+                response = requests.post(
+                    f"{HELIX_URL}/LinkRelatedMemories",
+                    json={"from_id": solution_id, "to_id": problem_id, "relationship": "solves", "strength": strength},
+                    headers={"Content-Type": "application/json"},
+                    timeout=10
+                )
+                response.raise_for_status()
+                return True
+            except Exception as fallback_e:
+                print(f"ERROR: Failed to create solves link (fallback): {fallback_e}", file=sys.stderr)
+                return False
+        print(f"ERROR: Failed to create solves link: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"ERROR: Failed to create solves link: {e}", file=sys.stderr)
+        return False
+
+def get_solutions_for(problem_id: str) -> List[Dict]:
+    """Get solutions that solve a problem (incoming Solves edges)."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetSolutionsFor",
+            json={"problem_id": problem_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("solutions", [])
+    except:
+        return []
+
+def get_solved_problems(solution_id: str) -> List[Dict]:
+    """Get problems that a solution solves (outgoing Solves edges)."""
+    if not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetSolvedProblems",
+            json={"solution_id": solution_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("problems", [])
+    except:
+        return []
+
 def get_implications(memory_id: str) -> List[Dict]:
     """Get what a memory implies (forward reasoning)."""
     if not check_helix_running():
@@ -1380,6 +1631,293 @@ def get_all_contexts() -> List[Dict]:
     except:
         return []
 
+
+def delete_context(context_id: str) -> bool:
+    """Delete a context node."""
+    if not check_helix_running():
+        return False
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/DeleteContext",
+            json={"context_id": context_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return True
+    except:
+        return False
+
+
+def clean_orphaned_contexts(dry_run: bool = True) -> dict:
+    """
+    Find and optionally delete Context nodes that don't match known projects.
+
+    Returns stats: {"found": N, "deleted": M, "known_projects": K}
+    """
+    import subprocess
+
+    if not check_helix_running():
+        return {"error": "HelixDB not running"}
+
+    # Get known projects from p --list
+    known_projects = set()
+    try:
+        result = subprocess.run(
+            ['python3', os.path.expanduser('~/Tools/p'), '--list'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split('\n'):
+            if ':' in line:
+                project_name = line.split(':')[0].strip().lower()
+                known_projects.add(project_name)
+    except Exception as e:
+        return {"error": f"Could not get project list: {e}"}
+
+    contexts = get_all_contexts()
+    if not contexts:
+        return {"found": 0, "deleted": 0, "known_projects": len(known_projects)}
+
+    stats = {"found": 0, "deleted": 0, "kept": 0, "known_projects": len(known_projects)}
+    orphaned = []
+
+    for ctx in contexts:
+        name = ctx.get("name", "").lower()
+        ctx_id = ctx.get("id", "")
+
+        if name in known_projects:
+            stats["kept"] += 1
+        else:
+            orphaned.append((name, ctx_id))
+            stats["found"] += 1
+
+    print(f"Known projects: {len(known_projects)}")
+    print(f"Total contexts: {len(contexts)}")
+    print(f"Valid contexts (match projects): {stats['kept']}")
+    print(f"Orphaned contexts (no matching project): {stats['found']}")
+
+    if orphaned:
+        print(f"\nOrphaned contexts:")
+        for name, ctx_id in orphaned[:20]:
+            print(f"  - {name} ({ctx_id[:8]}...)")
+        if len(orphaned) > 20:
+            print(f"  ... and {len(orphaned) - 20} more")
+
+    if dry_run:
+        print(f"\nDry run - no contexts deleted. Use --apply to delete.")
+    else:
+        print(f"\nDeleting {len(orphaned)} orphaned contexts...")
+        for name, ctx_id in orphaned:
+            if delete_context(ctx_id):
+                stats["deleted"] += 1
+                print(f"  Deleted: {name}")
+            else:
+                print(f"  FAILED: {name}")
+
+    return stats
+
+
+def get_or_create_project_context(project: str) -> Optional[str]:
+    """
+    Find existing project context or create new one.
+    Returns context_id or None on failure.
+
+    This is the key function for graph-based memory:
+    - Each project has ONE Context node
+    - All project memories link to it via BelongsTo edges
+    """
+    if not project or not check_helix_running():
+        return None
+
+    project_lower = project.lower().strip()
+
+    # 1. Check if context already exists
+    contexts = get_all_contexts()
+    for ctx in contexts:
+        ctx_name = ctx.get("name", "").lower()
+        ctx_type = ctx.get("context_type", "")
+        # Match by name and ensure it's a project context (not session)
+        if ctx_name == project_lower and ctx_type == "project":
+            return ctx.get("id")
+
+    # 2. Create new project context
+    context_id = create_context(
+        name=project_lower,
+        description=f"Project context for {project}",
+        context_type="project"
+    )
+
+    if context_id:
+        print(f"Created project context: {project_lower} ({context_id[:8]}...)", file=sys.stderr)
+
+    return context_id
+
+
+def get_memories_in_context(context_id: str) -> List[Dict]:
+    """Get all memories linked to a context via BelongsTo edges."""
+    if not context_id or not check_helix_running():
+        return []
+    try:
+        response = requests.post(
+            f"{HELIX_URL}/GetMemoriesInContext",
+            json={"context_id": context_id},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("memories", [])
+    except Exception as e:
+        print(f"ERROR: Failed to get memories in context: {e}", file=sys.stderr)
+        return []
+
+
+def get_project_memories_via_graph(project: str) -> List[Dict]:
+    """
+    Get ALL memories for a project by traversing the graph.
+
+    This is THE function for session start - instant, complete project context.
+
+    Steps:
+    1. Find project Context node
+    2. Get all memories linked via BelongsTo
+    3. Sort by importance
+    """
+    if not project or not check_helix_running():
+        return []
+
+    project_lower = project.lower().strip()
+
+    # Find project context
+    contexts = get_all_contexts()
+    context_id = None
+    for ctx in contexts:
+        if ctx.get("name", "").lower() == project_lower and ctx.get("context_type") == "project":
+            context_id = ctx.get("id")
+            break
+
+    if not context_id:
+        return []  # No project context exists yet
+
+    # Get all linked memories
+    memories = get_memories_in_context(context_id)
+
+    # Sort by importance (highest first)
+    memories.sort(key=lambda m: -m.get("importance", 0))
+
+    return memories
+
+
+def link_memory_to_project(memory_id: str, project: str) -> bool:
+    """
+    Link a memory to its project context.
+    Creates the project context if it doesn't exist.
+
+    Call this after storing any memory with a project tag.
+    """
+    if not memory_id or not project:
+        return False
+
+    context_id = get_or_create_project_context(project)
+    if not context_id:
+        return False
+
+    return link_memory_to_context(memory_id, context_id)
+
+
+def build_project_graph_from_tags() -> dict:
+    """
+    One-time migration: Build project graph from existing memory tags.
+
+    Scans all memories, extracts project names from tags,
+    creates Context nodes, and creates BelongsTo edges.
+
+    Only creates contexts for KNOWN projects from `p --list`.
+
+    Returns stats: {"projects": N, "links_created": M, "errors": E}
+    """
+    import subprocess
+
+    if not check_helix_running():
+        return {"error": "HelixDB not running"}
+
+    # Get known projects from p --list
+    known_projects = set()
+    try:
+        result = subprocess.run(
+            ['python3', os.path.expanduser('~/Tools/p'), '--list'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().split('\n'):
+            if ':' in line:
+                project_name = line.split(':')[0].strip().lower()
+                known_projects.add(project_name)
+        print(f"Found {len(known_projects)} known projects from p --list")
+    except Exception as e:
+        print(f"WARNING: Could not get project list: {e}")
+        print("Falling back to tag-based detection (may create extra contexts)")
+
+    memories = get_all_memories()
+    if not memories:
+        return {"projects": 0, "links_created": 0, "errors": 0}
+
+    # Track projects and their memories
+    project_memories = {}  # project_name -> [memory_ids]
+
+    for m in memories:
+        tags = m.get("tags", "")
+        memory_id = m.get("id")
+        if not memory_id or not tags:
+            continue
+
+        # Extract project names from tags - only if in known_projects
+        for tag in tags.lower().split(","):
+            tag = tag.strip()
+            if not tag or len(tag) < 3:
+                continue
+            # Skip session-like tags
+            if tag.startswith("session-") or tag.startswith("session_"):
+                continue
+
+            # Only include if it's a known project (or if we couldn't get p --list)
+            if known_projects and tag not in known_projects:
+                continue
+
+            if tag not in project_memories:
+                project_memories[tag] = []
+            project_memories[tag].append(memory_id)
+
+    # Create contexts and links
+    stats = {"projects": 0, "links_created": 0, "errors": 0, "skipped": 0}
+
+    # Filter to projects with 2+ memories
+    valid_projects = {p: mids for p, mids in project_memories.items() if len(mids) >= 2}
+    total_projects = len(valid_projects)
+    total_links = sum(len(mids) for mids in valid_projects.values())
+
+    print(f"Building graph: {total_projects} projects, ~{total_links} links to create...")
+
+    for i, (project, memory_ids) in enumerate(valid_projects.items()):
+        context_id = get_or_create_project_context(project)
+        if not context_id:
+            stats["errors"] += 1
+            continue
+
+        stats["projects"] += 1
+        print(f"Created project context: {project} ({context_id[:8]}...)")
+
+        for mid in memory_ids:
+            if link_memory_to_context(mid, context_id):
+                stats["links_created"] += 1
+            else:
+                stats["skipped"] += 1  # Already linked or error
+
+        # Progress every 50 projects
+        if (i + 1) % 50 == 0:
+            print(f"  Progress: {i+1}/{total_projects} projects, {stats['links_created']} links created...")
+
+    return stats
+
+
 # ============================================================================
 # RELATIONSHIP DETECTION & CONTEXTUAL SEARCH
 # ============================================================================
@@ -1677,7 +2215,7 @@ def contextual_search(query: str, k: int = 10, cwd: str = "", expand: bool = Tru
 # ============================================================================
 
 def link_related_memories(from_id: str, to_id: str, relationship: str, strength: int) -> bool:
-    """Link two memories with a relationship (legacy)."""
+    """Link two memories with a relationship."""
     if relationship == "supersedes":
         return create_supersedes(from_id, to_id)
     elif relationship == "implies":
@@ -1686,6 +2224,12 @@ def link_related_memories(from_id: str, to_id: str, relationship: str, strength:
         return create_contradiction(from_id, to_id, severity=strength)
     elif relationship == "because":
         return create_causal_link(from_id, to_id, strength=strength)
+    elif relationship == "solves":
+        # from_id is solution, to_id is problem
+        return create_solves_link(from_id, to_id, strength=strength)
+    elif relationship == "solved_by":
+        # from_id is problem, to_id is solution (reverse direction)
+        return create_solves_link(to_id, from_id, strength=strength)
 
     # Generic relationship
     if not check_helix_running():

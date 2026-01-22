@@ -128,7 +128,12 @@ def main():
     # Store
     print("\nStoring memories...")
     stored = store_memories(memories, args.project)
-    
+
+    # Narrate if enabled for this project
+    from narrator import maybe_narrate
+    if stored > 0:
+        maybe_narrate(memories, args.project)
+
     print(f"\n{'='*40}")
     print(f"Done: {stored}/{len(memories)} stored")
     print(f"{'='*40}\n")

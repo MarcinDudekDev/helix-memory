@@ -209,6 +209,11 @@ QUERY GetAllContexts() =>
     contexts <- N<Context>
     RETURN contexts
 
+// Delete context (for cleanup)
+QUERY DeleteContext(context_id: ID) =>
+    DROP N<Context>(context_id)
+    RETURN "deleted"
+
 // ============================================================================
 // BASIC CRUD
 // ============================================================================
@@ -244,3 +249,28 @@ QUERY GetRelatedMemories(memory_id: ID) =>
 QUERY GetMemoryEmbedding(memory_id: ID) =>
     embedding <- N<Memory>(memory_id)::Out<HasEmbedding>
     RETURN embedding
+
+// ============================================================================
+// PROBLEM-SOLUTION EDGES (Solves relationship)
+// ============================================================================
+
+// Create SOLVES relationship (solution -> problem)
+QUERY CreateSolvesLink(
+    solution_id: ID,
+    problem_id: ID,
+    strength: U32
+) =>
+    solution <- N<Memory>(solution_id)
+    problem <- N<Memory>(problem_id)
+    edge <- AddE<Solves>::From(solution)::To(problem)
+    RETURN edge
+
+// Get problems that a solution solves (outgoing Solves edges)
+QUERY GetSolvedProblems(solution_id: ID) =>
+    problems <- N<Memory>(solution_id)::Out<Solves>
+    RETURN problems
+
+// Get solutions that solve a problem (incoming Solves edges)
+QUERY GetSolutionsFor(problem_id: ID) =>
+    solutions <- N<Memory>(problem_id)::In<Solves>
+    RETURN solutions

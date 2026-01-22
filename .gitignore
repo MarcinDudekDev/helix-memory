@@ -33,3 +33,9 @@ logs/
 
 # Local overrides
 *.local
+
+# Batman planning artifacts
+.batman/
+
+# Claude local state
+.claude/

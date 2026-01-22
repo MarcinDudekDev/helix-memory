@@ -20,6 +20,7 @@ from hooks.common import (
     ensure_helix_running,
     find_similar_memories,
     delete_memory,
+    update_memory_tags,
     llm_generate,
     extract_json_array,
     hybrid_search,
@@ -28,74 +29,31 @@ from hooks.common import (
     contextual_search,
     detect_environment_from_path,
     link_memory_to_environment,
+    build_project_graph_from_tags,
+    get_project_memories_via_graph,
+    get_related_memories,
+    clean_orphaned_contexts,
     HELIX_URL,
     VALID_CATEGORIES,
     normalize_category,
 )
+from cli.utils import (
+    requires_helix,
+    resolve_memory_id,
+    parse_date_arg,
+    parse_memory_timestamp,
+    filter_memories_by_date
+)
+from cli.formatters import format_memory_detail
+from cli.validators import (
+    is_garbage,
+    is_corrupted,
+    GARBAGE_PATTERNS,
+    MemoryAnalysis,
+    analyze_memory
+)
 import requests
 import os
-
-
-def parse_memory_timestamp(memory: dict) -> datetime | None:
-    """
-    Extract creation timestamp from memory.
-    First tries created_at field (ISO timestamp), falls back to UUID parsing.
-    """
-    # Try created_at field first (ISO format)
-    created_at = memory.get('created_at')
-    if created_at:
-        try:
-            # Handle ISO format with/without microseconds
-            if '.' in created_at:
-                return datetime.fromisoformat(created_at)
-            else:
-                return datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-        except (ValueError, TypeError):
-            pass
-
-    # Fallback: try to parse from UUID (less reliable)
-    uuid_str = memory.get('id', '')
-    if uuid_str:
-        try:
-            # Remove hyphens and get first 12 hex chars
-            hex_str = uuid_str.replace('-', '')[:12]
-            unix_ms = int(hex_str, 16)
-            # Validate reasonable timestamp range (2020-2030)
-            if 1577836800000 < unix_ms < 1893456000000:
-                return datetime.fromtimestamp(unix_ms / 1000.0)
-        except (ValueError, OSError):
-            pass
-
-    return None
-
-
-def parse_date_arg(date_str: str) -> datetime | None:
-    """
-    Parse date argument. Supports:
-    - 'yesterday', 'today'
-    - 'YYYY-MM-DD' format
-    - 'N days ago' format
-    """
-    date_str = date_str.strip().lower()
-
-    if date_str == 'today':
-        return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    elif date_str == 'yesterday':
-        return (datetime.now() - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    elif date_str.endswith(' days ago'):
-        try:
-            days = int(date_str.split()[0])
-            return (datetime.now() - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
-        except ValueError:
-            pass
-
-    # Try ISO format YYYY-MM-DD
-    try:
-        return datetime.strptime(date_str, '%Y-%m-%d')
-    except ValueError:
-        pass
-
-    return None
 
 
 def cmd_store(args):
@@ -120,49 +78,150 @@ def cmd_store(args):
         print(f"  Category: {args.category}")
         print(f"  Importance: {args.importance}")
         print(f"  Tags: {args.tags}")
+
+        # Handle --solves flag: link this solution to a problem
+        if args.solves:
+            from hooks.common import link_related_memories
+            memories = get_all_memories()
+            problem_id = resolve_memory_id(args.solves, memories)
+            if link_related_memories(memory_id, problem_id, "solves", 8):
+                print(f"  Solves: {problem_id[:8]}...")
+            else:
+                print(f"  WARNING: Failed to create solves link to {args.solves}", file=sys.stderr)
     else:
         print("ERROR: Failed to store memory", file=sys.stderr)
         sys.exit(1)
 
+@requires_helix
 def cmd_search(args):
     """Search memories using vector/semantic search + text matching."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
+    query_lower = args.query.lower()
 
-    # Use contextual search if --context flag is set, otherwise use hybrid search
-    if args.contextual:
-        cwd = os.getcwd()
+    # Credential-related keywords that trigger tag-first search
+    CREDENTIAL_KEYWORDS = {
+        'credential', 'credentials', 'password', 'passwords', 'login', 'logins',
+        'secret', 'secrets', 'token', 'tokens', 'api key', 'api keys', 'apikey',
+        'auth', 'authentication', 'username', 'usernames', 'admin password',
+        'access key', 'ssh key', 'private key', 'api_key'
+    }
+
+    # Check if query contains credential keywords
+    is_credential_query = any(kw in query_lower for kw in CREDENTIAL_KEYWORDS)
+
+    matches = []
+    total_matches = 0  # Track total before limiting
+    search_type = ""
+
+    # Detect current project from cwd for context boosting
+    cwd = os.getcwd()
+    project = os.path.basename(cwd).lower()
+
+    if is_credential_query:
+        # CREDENTIAL SEARCH: Tag-first approach
+        all_memories = get_all_memories()
+        tag_matches = [m for m in all_memories if 'credentials' in m.get('tags', '').lower()]
+        content_matches = [m for m in all_memories
+                          if any(kw in m.get('content', '').lower() for kw in CREDENTIAL_KEYWORDS)
+                          and m not in tag_matches]
+
+        # Extract context terms (exclude credential keywords from boosting)
+        project_terms = [t.strip() for t in query_lower.split()
+                         if len(t) > 2 and t not in CREDENTIAL_KEYWORDS]
+
+        # Combine and score results
+        seen_ids = set()
+        scored_matches = []
+
+        for m in tag_matches:
+            mid = m.get('id')
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            score = 100  # Base score for tag match
+            content_lower = m.get('content', '').lower()
+            tags_lower = m.get('tags', '').lower()
+
+            # Boost if matches project context
+            if project and (project in content_lower or project in tags_lower):
+                score += 50
+            for term in project_terms:
+                if term in content_lower or term in tags_lower:
+                    score += 10
+            scored_matches.append((score, m))
+
+        for m in content_matches:
+            mid = m.get('id')
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            score = 50  # Lower base score for content match
+            content_lower = m.get('content', '').lower()
+            tags_lower = m.get('tags', '').lower()
+
+            if project and (project in content_lower or project in tags_lower):
+                score += 50
+            for term in project_terms:
+                if term in content_lower or term in tags_lower:
+                    score += 10
+            scored_matches.append((score, m))
+
+        scored_matches.sort(key=lambda x: x[0], reverse=True)
+        total_matches = len(scored_matches)
+        matches = [m for _, m in scored_matches[:args.limit]]
+        search_type = "credential-tag"
+
+        if not matches:
+            matches = hybrid_search(args.query, k=args.limit, window="full")
+            total_matches = len(matches)
+            search_type = "hybrid (fallback)"
+
+    elif args.contextual:
         matches = contextual_search(args.query, k=args.limit, cwd=cwd)
+        total_matches = len(matches)
         search_type = "contextual"
     else:
-        # Use hybrid search (vector similarity + text matching)
-        # window="full" searches all time, not just recent memories
-        matches = hybrid_search(args.query, k=args.limit, window="full")
+        # Get more than limit to know total available
+        all_results = hybrid_search(args.query, k=50, window="full")
+        total_matches = len(all_results)
+        matches = all_results[:args.limit]
         search_type = "hybrid"
 
     if not matches:
         print("No memories found matching query")
         return
 
-    print(f"Found {len(matches)} memory(ies) ({search_type} search):\n")
+    # Show context info if project detected and boosting applied
+    if project and project not in ['tools', 'users', 'cminds', 'home']:
+        print(f"📍 Context: {project} (boosting matches)")
+
+    # Hint for verbose credential queries
+    if is_credential_query and len(query_lower.split()) > 2:
+        print("💡 Tip: Use short queries like 'projectname credentials'")
+
+    print(f"\nFound {len(matches)} of {total_matches} matches ({search_type}):\n")
     for m in matches:
         importance = m.get('importance', '?')
         category = m.get('category', 'unknown').upper()
-        content = m.get('content', '')[:100]
+        content = m.get('content', '')
+        if not args.full:
+            content = content[:100] + ('...' if len(content) > 100 else '')
         tags = m.get('tags', '')
-        mid = m.get('id', '')  # Show full ID for easy copy-paste
-        print(f"[{category} - {importance}] {content}...")
+        mid = m.get('id', '')
+        print(f"[{category} - {importance}] {content}")
         print(f"  Tags: {tags}")
         print(f"  ID: {mid}\n")
 
+    # Show "more available" hint
+    if total_matches > args.limit:
+        print(f"📋 {total_matches - args.limit} more available. Use: memory search \"{args.query}\" -n {min(total_matches, 20)}")
+
+@requires_helix
 def cmd_list(args):
     """List all memories."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memories = get_all_memories()
+
+    # Handle positional limit (memory list 20) OR --limit/-n flag
+    limit = args.limit_positional or args.limit
 
     if args.category:
         memories = [m for m in memories if m.get('category') == args.category]
@@ -190,22 +249,7 @@ def cmd_list(args):
 
     # Filter memories by date
     if since_date or exact_date:
-        filtered = []
-        for m in memories:
-            created = parse_memory_timestamp(m)
-            if not created:
-                continue  # Skip if can't parse timestamp
-
-            if since_date and created >= since_date:
-                m['_created_at'] = created
-                filtered.append(m)
-            elif exact_date:
-                # Exact date match (same day)
-                next_day = exact_date + timedelta(days=1)
-                if exact_date <= created < next_day:
-                    m['_created_at'] = created
-                    filtered.append(m)
-        memories = filtered
+        memories = filter_memories_by_date(memories, since_date, exact_date)
 
     # Sort by importance (desc), or by date if filtering
     if show_dates:
@@ -213,8 +257,8 @@ def cmd_list(args):
     else:
         memories.sort(key=lambda m: m.get('importance', 0), reverse=True)
 
-    if args.limit:
-        memories = memories[:args.limit]
+    if limit:
+        memories = memories[:limit]
 
     if not memories:
         print("No memories found")
@@ -235,12 +279,9 @@ def cmd_list(args):
             print(f"[{category} - {importance}] {content}...")
         print(f"  ID: {mid}\n")
 
+@requires_helix
 def cmd_by_tag(args):
     """Get memories by tag."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memories = get_all_memories()
     tag = args.tag.lower()
 
@@ -257,31 +298,153 @@ def cmd_by_tag(args):
         content = m.get('content', '')[:80]
         print(f"[{category} - {importance}] {content}...\n")
 
+@requires_helix
+def cmd_creds(args):
+    """List/search credentials - dedicated credential recall."""
+    memories = get_all_memories()
+
+    # Filter to credentials tag ONLY (strict mode)
+    creds = [m for m in memories if 'credentials' in m.get('tags', '').lower()]
+
+    # If no tagged credentials found, also search content (fallback)
+    if not creds or args.project:
+        # Specific patterns that indicate actual credentials
+        CRED_PATTERNS = [' / ', 'password:', 'password=', 'username:', '@', 'sk_', 'whsec_']
+        EXCLUDE_PATTERNS = ['password hashing', 'password-protected', 'login persistence',
+                            'login flow', 'token cost', 'token usage']
+        for m in memories:
+            if m in creds:
+                continue
+            content_lower = m.get('content', '').lower()
+            # Skip exclusions
+            if any(ex in content_lower for ex in EXCLUDE_PATTERNS):
+                continue
+            if any(p in content_lower for p in CRED_PATTERNS):
+                creds.append(m)
+
+    # Filter by project if specified
+    if args.project:
+        project = args.project.lower()
+        creds = [m for m in creds if project in m.get('content', '').lower()
+                 or project in m.get('tags', '').lower()]
+
+    # Sort by importance (highest first), then by tags
+    creds.sort(key=lambda m: (-m.get('importance', 0), m.get('tags', '')))
+
+    if not creds:
+        if args.project:
+            print(f"No credentials found for '{args.project}'")
+        else:
+            print("No credentials found")
+        print("\nTip: Store with: memorize --cred \"project: user/pass\"")
+        return
+
+    print(f"Found {len(creds)} credential(s):\n")
+    for m in creds:
+        importance = m.get('importance', '?')
+        content = m.get('content', '')
+        tags = m.get('tags', '')
+        mid = m.get('id', '')[:8]
+
+        # Highlight the credential content more prominently
+        print(f"[{importance}] {content}")
+        print(f"    Tags: {tags}  ID: {mid}\n")
+
+
+@requires_helix
+def cmd_migrate_creds(args):
+    """Find and tag credentials that are missing the credentials tag."""
+    memories = get_all_memories()
+
+    # Specific patterns that indicate actual credentials (not just mentions)
+    CRED_PATTERNS = [
+        ' / ',           # username / password format
+        'password:',     # explicit password
+        'password=',     # password assignment
+        'login:',        # login credentials
+        'username:',     # explicit username
+        '@',             # user@host format (SSH)
+        'api_key=',      # API key assignment
+        'api key:',      # API key label
+        'token=',        # token assignment
+        'secret:',       # secret label
+        'sk_',           # Stripe secret key prefix
+        'whsec_',        # Webhook secret prefix
+    ]
+
+    # Patterns to EXCLUDE (false positives)
+    EXCLUDE_PATTERNS = [
+        'password hashing',
+        'password-protected',
+        'login persistence',
+        'login flow',
+        'login test',
+        'login page',
+        'token cost',
+        'token usage',
+        'token mismatch',
+        'session token',
+    ]
+
+    # Find memories with credential content but no credentials tag
+    untagged = []
+    for m in memories:
+        tags_lower = m.get('tags', '').lower()
+        if 'credentials' in tags_lower:
+            continue  # Already tagged
+        content_lower = m.get('content', '').lower()
+
+        # Skip if matches exclusion pattern
+        if any(ex in content_lower for ex in EXCLUDE_PATTERNS):
+            continue
+
+        # Include if matches credential pattern
+        if any(p in content_lower for p in CRED_PATTERNS):
+            untagged.append(m)
+
+    if not untagged:
+        print("All credentials are properly tagged!")
+        return
+
+    print(f"Found {len(untagged)} potential credentials without 'credentials' tag:\n")
+    for m in untagged[:20]:  # Show first 20
+        print(f"  [{m.get('category', '?').upper()}-{m.get('importance', '?')}] {m.get('content', '')[:70]}...")
+        print(f"      Current tags: {m.get('tags', '(none)')}")
+
+    if len(untagged) > 20:
+        print(f"\n  ... and {len(untagged) - 20} more")
+
+    if args.dry_run:
+        print(f"\nDry run: Would add 'credentials' tag to {len(untagged)} memories")
+        print("Run with --apply to execute")
+        return
+
+    if not args.apply:
+        print(f"\nRun with --apply to add 'credentials' tag to these {len(untagged)} memories")
+        return
+
+    # Apply the changes
+    updated = 0
+    for m in untagged:
+        mem_id = m.get('id')
+        old_tags = m.get('tags', '')
+        new_tags = f"{old_tags},credentials" if old_tags else "credentials"
+        if update_memory_tags(mem_id, new_tags):
+            updated += 1
+
+    print(f"\nUpdated {updated} of {len(untagged)} memories with 'credentials' tag")
+
+
+@requires_helix
 def cmd_delete(args):
     """Delete a memory by ID (supports partial ID prefix matching)."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memory_id = args.id
 
     # Support partial ID matching (prefix)
     if len(memory_id) < 36:  # Full UUID is 36 chars
         memories = get_all_memories()
-        matches = [m for m in memories if m.get('id', '').startswith(memory_id)]
-
-        if len(matches) == 0:
-            print(f"ERROR: No memory found with ID prefix: {memory_id}", file=sys.stderr)
-            sys.exit(1)
-        elif len(matches) > 1:
-            print(f"ERROR: Multiple memories match prefix '{memory_id}':", file=sys.stderr)
-            for m in matches:
-                print(f"  {m.get('id')} - {m.get('content', '')[:50]}...", file=sys.stderr)
-            print("Provide more characters to uniquely identify", file=sys.stderr)
-            sys.exit(1)
-        else:
-            memory_id = matches[0].get('id')
-            print(f"Matched: {memory_id}")
+        memory_id = resolve_memory_id(memory_id, memories)
+        print(f"Matched: {memory_id}")
 
     if delete_memory(memory_id):
         print(f"Deleted memory: {memory_id}")
@@ -289,17 +452,102 @@ def cmd_delete(args):
         print(f"ERROR: Failed to delete memory: {memory_id}", file=sys.stderr)
         sys.exit(1)
 
-def cmd_categorize(args):
-    """Auto-categorize content using LLM (Ollama or Haiku)."""
-    content = args.content
+@requires_helix
+def cmd_retag(args):
+    """Update/replace tags on an existing memory."""
+    memory_id = args.id
+    memories = get_all_memories()
 
+    # Resolve partial ID
+    if len(memory_id) < 36:
+        memory_id = resolve_memory_id(memory_id, memories)
+        print(f"Matched: {memory_id}")
+
+    # Get current memory to show before/after
+    current = next((m for m in memories if m.get('id') == memory_id), None)
+    if not current:
+        print(f"ERROR: Memory not found: {memory_id}", file=sys.stderr)
+        sys.exit(1)
+
+    old_tags = current.get('tags', '')
+
+    # Determine new tags based on mode
+    if args.add:
+        # Add tag to existing tags
+        existing_tags = [t.strip() for t in old_tags.split(',') if t.strip()]
+        if args.add not in existing_tags:
+            existing_tags.append(args.add)
+        new_tags = ','.join(existing_tags)
+    elif args.remove:
+        # Remove tag from existing tags
+        existing_tags = [t.strip() for t in old_tags.split(',') if t.strip()]
+        existing_tags = [t for t in existing_tags if t.lower() != args.remove.lower()]
+        new_tags = ','.join(existing_tags)
+    else:
+        # Replace all tags
+        new_tags = args.tags if args.tags else ''
+
+    # Show what will change
+    print(f"Memory: {current.get('content', '')[:60]}...")
+    print(f"  Old tags: {old_tags or '(none)'}")
+    print(f"  New tags: {new_tags or '(none)'}")
+
+    if old_tags == new_tags:
+        print("No change needed.")
+        return
+
+    # Perform the update
+    if update_memory_tags(memory_id, new_tags):
+        print(f"Successfully retagged memory {memory_id[:8]}...")
+    else:
+        print(f"ERROR: Failed to retag memory", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_categorize(args):
+    """Auto-categorize content using LLM (Ollama or Haiku).
+
+    First checks for explicit prefixes in content (TASK:, BUG:, DECISION:, etc.)
+    before falling back to LLM categorization.
+    """
+    import re
+    content = args.content
+    content_upper = content.strip().upper()
+
+    # Prefix-to-category mapping with default importance
+    prefix_map = {
+        'TASK:': ('task', 6),
+        'BUG:': ('solution', 7),
+        'FIX:': ('solution', 7),
+        'DECISION:': ('decision', 8),
+        'PREFERENCE:': ('preference', 8),
+        'PREF:': ('preference', 8),
+        'FACT:': ('fact', 5),
+        'SOLUTION:': ('solution', 7),
+        'LEARNING:': ('fact', 6),
+        'TIL:': ('fact', 5),  # Today I Learned
+        'NOTE:': ('fact', 4),
+        'TODO:': ('task', 5),
+        'IMPORTANT:': ('fact', 9),
+        'CRITICAL:': ('decision', 10),
+    }
+
+    # Check for explicit prefixes
+    for prefix, (category, importance) in prefix_map.items():
+        if content_upper.startswith(prefix):
+            # Extract tags from content (words after common patterns)
+            tag_words = re.findall(r'#(\w+)', content)
+            tags = ','.join(tag_words) if tag_words else ''
+            print(f'{{"category": "{category}", "importance": {importance}, "tags": "{tags}"}}')
+            return
+
+    # No prefix found - use LLM
     prompt = f'''Categorize this memory. Return ONLY JSON: {{"category": "preference|fact|decision|solution", "importance": 1-10, "tags": "comma,separated"}}
 Memory: {content}'''
 
     output, provider = llm_generate(prompt, timeout=30)
     if output:
         # Extract JSON object
-        import re
         match = re.search(r'\{[^}]+\}', output)
         if match:
             print(match.group(0))
@@ -308,12 +556,9 @@ Memory: {content}'''
     # Fallback: return default
     print('{"category": "fact", "importance": 5, "tags": ""}')
 
+@requires_helix
 def cmd_reindex(args):
     """Generate embeddings for all memories that don't have them."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memories = get_all_memories()
     print(f"Total memories: {len(memories)}")
 
@@ -335,7 +580,7 @@ def cmd_reindex(args):
                     to_index.append(m)
             else:
                 to_index.append(m)
-        except:
+        except Exception:
             to_index.append(m)
 
     if not to_index:
@@ -379,12 +624,9 @@ def cmd_reindex(args):
 
     print(f"\nCompleted: {success_count} indexed, {error_count} errors")
 
+@requires_helix
 def cmd_link_environments(args):
     """Auto-link memories to their environment contexts based on tags and content."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memories = get_all_memories()
     print(f"Analyzing {len(memories)} memories for environment relationships...")
 
@@ -423,12 +665,9 @@ def cmd_link_environments(args):
 
     print(f"\nCompleted: {linked_count} memories linked, {skip_count} skipped")
 
+@requires_helix
 def cmd_dedup(args):
     """Find and remove duplicate memories."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memories = get_all_memories()
     print(f"Analyzing {len(memories)} memories for duplicates...")
 
@@ -492,89 +731,23 @@ def cmd_dedup(args):
 
     print(f"\nDeleted: {deleted}, Errors: {errors}")
 
+@requires_helix
 def cmd_status(args):
     """Check HelixDB status."""
-    if check_helix_running():
-        memories = get_all_memories()
-        print("HelixDB: RUNNING")
-        print(f"Memories: {len(memories)}")
+    memories = get_all_memories()
+    print("HelixDB: RUNNING")
+    print(f"Memories: {len(memories)}")
 
-        # Count by category
-        categories = {}
-        for m in memories:
-            cat = m.get('category', 'unknown')
-            categories[cat] = categories.get(cat, 0) + 1
+    # Count by category
+    categories = {}
+    for m in memories:
+        cat = m.get('category', 'unknown')
+        categories[cat] = categories.get(cat, 0) + 1
 
-        if categories:
-            print("\nBy category:")
-            for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
-                print(f"  {cat}: {count}")
-    else:
-        print("HelixDB: NOT RUNNING")
-        print("Start with: memory start")
-        sys.exit(1)
-
-
-# ============================================================================
-# GARBAGE DETECTION PATTERNS
-# ============================================================================
-
-GARBAGE_PATTERNS = [
-    r"^(yes|no|ok|done|thanks)\.?$",  # Too short/vague
-    r"were provided\.?$",              # Vague reference
-    r"was (set|created|updated)\.?$",  # Vague without specifics
-    r"^The (user|assistant) ",         # Meta-description
-    r'^<bash-',                         # Bash output markers
-    r'bash-stdout|bash-stderr',
-    r'^\[.*\]$',                        # Single bracketed content
-    r'^Perfect!',                       # Generic acknowledgments
-    r'^Done!',
-    r'^Great!',
-    r'^Let me',                         # Task narration
-    r'^Now let me',
-    r'^Now I',
-    r"^I'll",
-    r"^I'm going to",
-    r'^\s*\[\d+',                       # Line number prefixes
-    r'^\s*cat /',                       # Raw cat output
-    r'server\s*\{',                     # Nginx configs
-    r'location\s*~',
-    r'#!/bin/bash',                     # Script content
-    r'#!/usr/bin/env',
-    r'^Base directory for this skill:', # Skill loading
-    r'This session is being continued', # Session continuations
-    r'\[38;5;',                         # Terminal escape codes
-    r'\[\?2026',
-    r'^Project path:.*Context:.*<bash', # Corrupted path+bash combo
-    r'^Project location:.*`\)',         # Malformed path
-]
-
-
-def is_garbage(content: str) -> bool:
-    """Check if content matches garbage patterns."""
-    import re
-    content = content.strip()
-
-    # Too short
-    if len(content) < 20:
-        return True
-
-    for pattern in GARBAGE_PATTERNS:
-        if re.search(pattern, content, re.IGNORECASE | re.MULTILINE):
-            return True
-    return False
-
-
-def is_corrupted(content: str) -> bool:
-    """Check for corrupted/malformed memories."""
-    content = content.strip()
-    if len(content) < 20:
-        return True
-    if content.startswith(('@', '[?', '</', '`)', '...')):
-        return True
-    if content.count('<bash') != content.count('</bash'):
-        return True
-    return False
+    if categories:
+        print("\nBy category:")
+        for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
+            print(f"  {cat}: {count}")
 
 
 def find_semantic_duplicates(memories: list, threshold: float = 0.85, use_vectors: bool = True) -> list:
@@ -694,12 +867,9 @@ def find_duplicates_fast(memories: list) -> list:
     return duplicates
 
 
+@requires_helix
 def cmd_health(args):
     """Show memory health report with vector-based duplicate detection."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memories = get_all_memories()
     total = len(memories)
 
@@ -778,12 +948,9 @@ def cmd_health(args):
         print(f"  Run 'memory link-all' to create edges between related memories")
 
 
+@requires_helix
 def cmd_garbage(args):
     """Find and optionally delete garbage memories."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memories = get_all_memories()
     garbage = []
 
@@ -836,12 +1003,9 @@ def cmd_garbage(args):
     print(f"\nDeleted: {deleted}, Errors: {errors}")
 
 
+@requires_helix
 def cmd_link(args):
     """Create edge between two memories."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     from_id = args.from_id
     to_id = args.to_id
     relationship = args.relationship
@@ -850,57 +1014,42 @@ def cmd_link(args):
     # Support partial ID matching
     memories = get_all_memories()
 
-    def resolve_id(partial):
-        if len(partial) >= 36:
-            return partial
-        matches = [m for m in memories if m.get('id', '').startswith(partial)]
-        if len(matches) == 1:
-            return matches[0].get('id')
-        elif len(matches) == 0:
-            print(f"ERROR: No memory found with ID prefix: {partial}", file=sys.stderr)
-            sys.exit(1)
-        else:
-            print(f"ERROR: Multiple memories match prefix '{partial}'", file=sys.stderr)
-            sys.exit(1)
-
-    from_id = resolve_id(from_id)
-    to_id = resolve_id(to_id)
+    from_id = resolve_memory_id(from_id, memories)
+    to_id = resolve_memory_id(to_id, memories)
 
     from hooks.common import link_related_memories
 
     if link_related_memories(from_id, to_id, relationship, strength):
         print(f"Linked: {from_id[:8]}... --[{relationship}]--> {to_id[:8]}...")
+
+        # For solves/solved_by/related relationships, also create reverse edge
+        # so both memories can see each other via 'memory show'
+        # (cmd_show infers relationship type from memory categories)
+        if relationship in ('solves', 'solved_by', 'related'):
+            # Use generic 'related' for reverse edge - display is category-based
+            response = requests.post(
+                f"{HELIX_URL}/LinkRelatedMemories",
+                json={"from_id": to_id, "to_id": from_id, "relationship": "related", "strength": strength},
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            if response.ok:
+                print(f"  (bidirectional edge created)")
     else:
         print("ERROR: Failed to create link", file=sys.stderr)
         sys.exit(1)
 
 
+@requires_helix
 def cmd_merge(args):
     """Merge duplicate memories (keep one, delete others)."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     keep_id = args.keep_id
     delete_ids = args.delete_ids
 
     memories = get_all_memories()
 
-    def resolve_id(partial):
-        if len(partial) >= 36:
-            return partial
-        matches = [m for m in memories if m.get('id', '').startswith(partial)]
-        if len(matches) == 1:
-            return matches[0].get('id')
-        elif len(matches) == 0:
-            print(f"ERROR: No memory found with ID prefix: {partial}", file=sys.stderr)
-            sys.exit(1)
-        else:
-            print(f"ERROR: Multiple memories match prefix '{partial}'", file=sys.stderr)
-            sys.exit(1)
-
-    keep_id = resolve_id(keep_id)
-    delete_ids = [resolve_id(d) for d in delete_ids]
+    keep_id = resolve_memory_id(keep_id, memories)
+    delete_ids = [resolve_memory_id(d, memories) for d in delete_ids]
 
     # Show what will be merged
     keep_mem = next((m for m in memories if m.get('id') == keep_id), {})
@@ -933,176 +1082,6 @@ def cmd_merge(args):
             print(f"  Deleted: {did[:8]}...")
 
     print(f"\nMerged: {deleted} memories into {keep_id[:8]}...")
-
-
-# ============================================================================
-# INTELLIGENT MEMORY CURATION
-# ============================================================================
-
-class MemoryAnalysis:
-    """Result of analyzing a single memory."""
-    def __init__(self, memory_id: str):
-        self.id = memory_id
-        self.action = "keep"  # keep, delete, merge, link
-        self.reason = ""
-        self.related_ids = []  # List of (id, similarity, relationship_type)
-        self.duplicate_of = None  # If duplicate, ID of the original
-        self.similarity_score = 0.0
-        self.quality_score = 0  # 0-10
-        self.issues = []  # List of detected issues
-
-
-def analyze_memory(memory: dict, all_memories: list, cache: dict) -> MemoryAnalysis:
-    """
-    Deeply analyze a single memory and determine what to do with it.
-
-    Considers:
-    - Content quality (length, structure, patterns)
-    - Duplicate detection via hash and semantic similarity
-    - Relationship mapping to other memories
-    - Category-specific rules
-
-    Returns MemoryAnalysis with recommended action and reasoning.
-    """
-    from hooks.common import (
-        search_by_similarity,
-        calculate_semantic_similarity,
-        get_related_memories,
-        content_hash
-    )
-
-    mid = memory.get('id', '')
-    content = memory.get('content', '')
-    category = memory.get('category', '')
-    importance = memory.get('importance', 5)
-    tags = memory.get('tags', '')
-
-    analysis = MemoryAnalysis(mid)
-
-    # === STEP 1: Quality Assessment ===
-
-    # Check for corrupted content
-    if is_corrupted(content):
-        analysis.action = "delete"
-        analysis.reason = "Corrupted content (truncated, malformed, or too short)"
-        analysis.quality_score = 0
-        analysis.issues.append("corrupted")
-        return analysis
-
-    # Check for garbage patterns
-    if is_garbage(content):
-        analysis.action = "delete"
-        analysis.reason = "Low-value content (task narration, bash output, generic acknowledgment)"
-        analysis.quality_score = 1
-        analysis.issues.append("garbage_pattern")
-        return analysis
-
-    # Calculate base quality score
-    quality = importance
-    if len(content) > 100:
-        quality += 1
-    if len(content) > 200:
-        quality += 1
-    if tags and len(tags) > 3:
-        quality += 1
-    if category in ('preference', 'decision', 'solution'):
-        quality += 1  # High-value categories
-    analysis.quality_score = min(10, quality)
-
-    # === STEP 2: Exact Duplicate Detection (via hash) ===
-
-    c_hash = content_hash(content)
-    if c_hash in cache.get('hashes', {}):
-        existing_id = cache['hashes'][c_hash]
-        if existing_id != mid:
-            analysis.action = "merge"
-            analysis.duplicate_of = existing_id
-            analysis.similarity_score = 1.0
-            analysis.reason = f"Exact duplicate of {existing_id[:8]}"
-            return analysis
-    else:
-        cache.setdefault('hashes', {})[c_hash] = mid
-
-    # === STEP 3: Semantic Similarity Search ===
-
-    try:
-        # Find semantically similar memories using vector search
-        similar = search_by_similarity(content, k=8, window="full")
-
-        for s in similar:
-            sid = s.get('id', '')
-            if sid == mid:
-                continue
-
-            # Calculate actual semantic similarity using embeddings
-            try:
-                sim_score = calculate_semantic_similarity(content, s.get('content', ''))
-            except Exception as e:
-                analysis.issues.append(f"similarity_calc_error: {e}")
-                continue
-
-            # Validate similarity score
-            if not (0 <= sim_score <= 1):
-                continue
-
-            # High similarity (>0.90) = potential duplicate
-            if sim_score >= 0.90:
-                s_importance = s.get('importance', 5)
-                if importance >= s_importance:
-                    # This memory is better/equal, mark other as superseded
-                    analysis.related_ids.append((sid, sim_score, "supersedes"))
-                else:
-                    # Other memory is better, this one should merge
-                    analysis.action = "merge"
-                    analysis.duplicate_of = sid
-                    analysis.similarity_score = sim_score
-                    analysis.reason = f"Duplicate of higher-importance memory {sid[:8]} ({sim_score:.0%} similar)"
-                    return analysis
-
-            # Moderate similarity (0.65-0.90) = related, should link
-            elif sim_score >= 0.65:
-                # Determine relationship type based on categories
-                s_cat = s.get('category', '')
-
-                if category == 'decision' and s_cat == 'solution':
-                    rel_type = 'implies'
-                elif category == 'problem' and s_cat == 'solution':
-                    rel_type = 'leads_to'
-                elif category == 'fact' and s_cat == 'preference':
-                    rel_type = 'supports'
-                else:
-                    rel_type = 'related'
-
-                analysis.related_ids.append((sid, sim_score, rel_type))
-
-    except Exception as e:
-        analysis.issues.append(f"similarity_search_error: {e}")
-
-    # === STEP 4: Check Existing Edges ===
-
-    try:
-        existing_edges = get_related_memories(mid)
-        has_sufficient_edges = len(existing_edges) >= 2
-    except Exception:
-        has_sufficient_edges = False
-        analysis.issues.append("edge_check_failed")
-
-    # === STEP 5: Determine Final Action ===
-
-    if analysis.action == "merge":
-        # Already set in duplicate detection
-        pass
-    elif analysis.related_ids and not has_sufficient_edges:
-        analysis.action = "link"
-        analysis.reason = f"Found {len(analysis.related_ids)} related memories to connect"
-    elif analysis.quality_score >= 7:
-        analysis.action = "keep"
-        analysis.reason = "High quality memory, well-connected"
-    else:
-        analysis.action = "keep"
-        analysis.reason = "Acceptable quality, no issues"
-
-    return analysis
 
 
 def cmd_curate(args):
@@ -1242,7 +1221,7 @@ def cmd_curate(args):
 
     for i, m in enumerate(memories):
         try:
-            analysis = analyze_memory(m, memories, cache)
+            analysis = analyze_memory(m, cache)
             results[analysis.action].append(analysis)
 
             if analysis.action != 'keep':
@@ -1288,6 +1267,7 @@ def cmd_curate(args):
     print(f"Next: 'curate review' to inspect, 'curate apply' to execute")
 
 
+@requires_helix
 def cmd_migrate(args):
     """
     Migrate memories with invalid categories to valid ones.
@@ -1296,10 +1276,6 @@ def cmd_migrate(args):
     displays the mapping that would be applied, and with --apply
     actually updates them.
     """
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
-
     memories = get_all_memories()
     print(f"Scanning {len(memories)} memories for invalid categories...\n")
 
@@ -1384,14 +1360,11 @@ def cmd_migrate(args):
     print(f"\nMigration complete: {success} migrated, {errors} errors")
 
 
+@requires_helix
 def cmd_projects(args):
     """List projects worked on based on memory tags, cross-referenced with p --list."""
     import subprocess
     from collections import Counter
-
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
 
     # Get known projects from p --list
     try:
@@ -1470,11 +1443,75 @@ def cmd_projects(args):
             print()
 
 
+@requires_helix
+def cmd_context(args):
+    """Show all infrastructure info (paths, credentials, URLs) for a project."""
+    # Get project name from args or cwd
+    if args.project:
+        project = args.project.lower()
+    else:
+        project = os.path.basename(os.getcwd()).lower()
+
+    memories = get_all_memories()
+
+    # Keywords that indicate infrastructure/config info
+    infra_keywords = [
+        'path', 'url', 'ssh', 'rsync', 'staging', 'production', 'live',
+        'credential', 'password', 'api key', 'token', 'server', 'host',
+        'domain', 'database', 'db', 'port', 'login', 'admin', 'ftp', 'sftp',
+        'endpoint', 'secret', 'key', 'ip ', 'cloudflare', 'dns', 'email'
+    ]
+
+    # Filter memories that:
+    # 1. Match project name in tags or content
+    # 2. Contain infrastructure keywords OR are credential/fact category
+    matches = []
+    for m in memories:
+        content = m.get('content', '').lower()
+        tags = m.get('tags', '').lower()
+        category = m.get('category', '').lower()
+
+        # Must match project
+        if project not in content and project not in tags:
+            continue
+
+        # Must be infrastructure-related
+        is_infra = category in ('credential', 'fact', 'solution')
+        if not is_infra:
+            for kw in infra_keywords:
+                if kw in content or kw in tags:
+                    is_infra = True
+                    break
+
+        if is_infra:
+            matches.append(m)
+
+    # Sort by importance desc
+    matches.sort(key=lambda m: m.get('importance', 0), reverse=True)
+
+    if not matches:
+        print(f"No infrastructure info found for project: {project}")
+        print(f"Tip: Store with tags like '{project}' or mention '{project}' in content")
+        return
+
+    print(f"=== {project.upper()} Infrastructure ({len(matches)} items) ===\n")
+    for m in matches:
+        importance = m.get('importance', '?')
+        category = m.get('category', 'unknown').upper()
+        content = m.get('content', '')
+        tags = m.get('tags', '')
+        mid = m.get('id', '')[:8]
+
+        print(f"[{category}-{importance}] {content}")
+        if tags:
+            print(f"  Tags: {tags}")
+        print(f"  ID: {mid}\n")
+
+
+@requires_helix
 def cmd_show(args):
-    """Show memory details and its edges."""
-    if not check_helix_running():
-        print("ERROR: HelixDB not running", file=sys.stderr)
-        sys.exit(1)
+    """Show memory details and its edges, grouped by relationship type."""
+    from hooks.common import get_implications, get_contradictions
 
     mem_id = args.id
     memories = get_all_memories()
@@ -1487,45 +1524,182 @@ def cmd_show(args):
 
     mem = matches[0]
     full_id = mem.get('id')
+    category = mem.get('category', '').lower()
 
     # Print memory details
-    print("=" * 60)
-    print(f"[{mem.get('category', '?').upper()}-{mem.get('importance', 0)}] {full_id[:8]}")
-    print("=" * 60)
-    print(f"Content:    {mem.get('content', '')}")
-    print(f"Category:   {mem.get('category', '?')}")
-    print(f"Importance: {mem.get('importance', 0)}")
-    print(f"Tags:       {mem.get('tags', '')}")
-    print(f"Created:    {mem.get('created_at', '?')}")
-    print(f"Full ID:    {full_id}")
+    print(format_memory_detail(mem))
 
-    # Get edges
+    # Track all shown IDs to avoid duplicates across sections
+    shown_ids = {full_id}
+    total_edges = 0
+
+    def print_edge_section(title: str, memories_list: list, limit: int = 5):
+        """Helper to print an edge section."""
+        nonlocal total_edges
+        if not memories_list:
+            return
+        # Dedupe
+        unique = []
+        for m in memories_list:
+            mid = m.get('id', '')
+            if mid and mid not in shown_ids:
+                shown_ids.add(mid)
+                unique.append(m)
+        if not unique:
+            return
+        total_edges += len(unique)
+        print(f"\n{title}")
+        for rel in unique[:limit]:
+            print(f"  → [{rel.get('category', '?').upper()}-{rel.get('importance', 0)}] {rel.get('id', '?')[:8]}")
+            print(f"    {rel.get('content', '')[:60]}...")
+        if len(unique) > limit:
+            print(f"  ... and {len(unique) - limit} more")
+
+    # Get all related memories first
+    all_related = []
     try:
         import requests
         r = requests.post(f"{HELIX_URL}/GetRelatedMemories", json={"memory_id": full_id}, timeout=5)
         data = r.json()
-        related = data.get('related', [])
+        all_related = data.get('related', [])
+    except Exception:
+        pass
 
-        # Dedupe by ID
-        seen_ids = set()
-        unique_related = []
-        for rel in related:
-            rid = rel.get('id')
-            if rid and rid not in seen_ids:
-                seen_ids.add(rid)
-                unique_related.append(rel)
+    # Group related memories by their category to infer relationship type
+    # (Until HelixDB stores edge types properly, we infer from memory categories)
+    solutions = [m for m in all_related if m.get('category', '').lower() == 'solution']
+    problems = [m for m in all_related if m.get('category', '').lower() == 'problem']
+    others = [m for m in all_related if m.get('category', '').lower() not in ('solution', 'problem')]
 
-        if unique_related:
-            print(f"\n--- Related ({len(unique_related)} edges) ---")
-            for rel in unique_related[:10]:
-                print(f"  → [{rel.get('category', '?').upper()}-{rel.get('importance', 0)}] {rel.get('id', '?')[:8]}")
-                print(f"    {rel.get('content', '')[:60]}...")
-            if len(unique_related) > 10:
-                print(f"  ... and {len(unique_related) - 10} more")
-        else:
-            print(f"\n--- No edges (orphan) ---")
-    except Exception as e:
-        print(f"\n--- Could not fetch edges: {e} ---")
+    # 1. SOLVED BY - show solutions for this problem
+    if category == 'problem' and solutions:
+        print_edge_section("--SOLVED BY--", solutions)
+
+    # 2. SOLVES - show problems this solution solves
+    if category == 'solution' and problems:
+        print_edge_section("--SOLVES--", problems)
+
+    # 3. IMPLIES - logical implications
+    implies = get_implications(full_id)
+    print_edge_section("--IMPLIES--", implies)
+
+    # 4. CONTRADICTS - contradicting memories
+    contradicts = get_contradictions(full_id)
+    print_edge_section("--CONTRADICTS--", contradicts)
+
+    # 5. RELATED - everything else
+    # Include solutions/problems if this memory isn't of those types
+    remaining = others[:]
+    if category != 'problem':
+        remaining.extend(solutions)
+    if category != 'solution':
+        remaining.extend(problems)
+    print_edge_section("--RELATED--", remaining, limit=10)
+
+    if total_edges == 0:
+        print(f"\n--- No edges (orphan) ---")
+
+
+@requires_helix
+def cmd_graph_build(args):
+    """Build project graph from existing memory tags."""
+    print("Building project graph from tags...")
+    stats = build_project_graph_from_tags()
+    print(f"Created {stats.get('projects', 0)} project contexts")
+    print(f"Created {stats.get('links_created', 0)} BelongsTo edges")
+    if stats.get('errors'):
+        print(f"Errors: {stats.get('errors')}")
+
+
+@requires_helix
+def cmd_graph_clean(args):
+    """Clean orphaned context nodes that don't match known projects."""
+    stats = clean_orphaned_contexts(dry_run=not args.apply)
+    if args.apply:
+        print(f"\nDeleted {stats.get('deleted', 0)} orphaned contexts")
+
+
+@requires_helix
+def cmd_graph_show(args):
+    """Show memories linked to a project via graph with relationship tree."""
+    memories = get_project_memories_via_graph(args.project)
+    if not memories:
+        print(f"No memories linked to project: {args.project}")
+        print(f"Tip: Run 'memory graph build' to create project contexts from tags")
+        return
+
+    # Track which memories we've shown to avoid duplicates
+    shown_ids = set()
+
+    def format_memory(m, prefix=""):
+        """Format a single memory line."""
+        cat = m.get('category', 'unknown').upper()
+        imp = m.get('importance', '?')
+        content = m.get('content', '')[:70]
+        mid = m.get('id', '')[:8]
+        return f"{prefix}[{cat}-{imp}] {content}... ({mid})"
+
+    def show_related(memory_id, depth=0, max_depth=2):
+        """Recursively show related memories up to max_depth."""
+        if depth >= max_depth:
+            return
+
+        related = get_related_memories(memory_id)
+        if not related:
+            return
+
+        for i, rel in enumerate(related[:3]):  # Limit to 3 per node
+            rel_id = rel.get('id', '')
+            if rel_id in shown_ids:
+                continue
+            shown_ids.add(rel_id)
+
+            # Tree branch characters
+            is_last = (i == len(related[:3]) - 1)
+            branch = "└─→ " if is_last else "├─→ "
+            indent = "    " * depth
+
+            print(f"{indent}{branch}{format_memory(rel)}")
+
+            # Recurse for deeper relationships
+            show_related(rel_id, depth + 1, max_depth)
+
+    print(f"[{args.project}] Context ({len(memories)} memories)\n")
+
+    # Group by category for better organization
+    by_category = {}
+    for m in memories:
+        cat = m.get('category', 'unknown')
+        if cat not in by_category:
+            by_category[cat] = []
+        by_category[cat].append(m)
+
+    # Priority order for categories
+    cat_order = ['preference', 'decision', 'fact', 'solution', 'context', 'task', 'problem']
+
+    for cat in cat_order:
+        if cat not in by_category:
+            continue
+        mems = by_category[cat]
+        # Sort by importance within category
+        mems.sort(key=lambda x: -x.get('importance', 0))
+
+        print(f"── {cat.upper()} ({len(mems)}) ──")
+
+        for m in mems[:5]:  # Top 5 per category
+            mid = m.get('id', '')
+            if mid in shown_ids:
+                continue
+            shown_ids.add(mid)
+
+            print(format_memory(m, "├── "))
+
+            # Show relationships for this memory
+            show_related(mid, depth=1, max_depth=2)
+
+        if len(mems) > 5:
+            print(f"    ... and {len(mems) - 5} more {cat} memories")
+        print()
 
 
 def main():
@@ -1539,19 +1713,22 @@ def main():
     store_parser.add_argument('--importance', '-i', type=int, default=5, help='Importance 1-10')
     store_parser.add_argument('--tags', '-g', default='', help='Comma-separated tags')
     store_parser.add_argument('--force', '-f', action='store_true', help='Store even if similar exists')
+    store_parser.add_argument('--solves', metavar='PROBLEM_ID', help='Link this solution to a problem ID (creates solves edge)')
     store_parser.set_defaults(func=cmd_store)
 
     # search command
     search_parser = subparsers.add_parser('search', help='Search memories')
     search_parser.add_argument('query', help='Search query')
-    search_parser.add_argument('--limit', '-n', type=int, default=20, help='Max results to return (default: 20)')
+    search_parser.add_argument('--limit', '-n', type=int, default=5, help='Max results (default: 5, use -n 20 for more)')
+    search_parser.add_argument('--full', '-f', action='store_true', help='Show full content (no truncation)')
     search_parser.add_argument('--contextual', '-c', action='store_true', help='Use contextual/relationship-aware search')
     search_parser.set_defaults(func=cmd_search)
 
     # list command
     list_parser = subparsers.add_parser('list', help='List all memories')
+    list_parser.add_argument('limit_positional', nargs='?', type=int, metavar='N', help='Limit results (shorthand)')
     list_parser.add_argument('--category', '-t', help='Filter by category')
-    list_parser.add_argument('--limit', '-l', type=int, help='Limit results')
+    list_parser.add_argument('--limit', '-n', type=int, help='Limit results')
     list_parser.add_argument('--since', help='Show memories created after date (yesterday, 2026-01-10, "3 days ago")')
     list_parser.add_argument('--date', help='Show memories created on exact date (2026-01-10)')
     list_parser.set_defaults(func=cmd_list)
@@ -1561,10 +1738,30 @@ def main():
     tag_parser.add_argument('tag', help='Tag to search for')
     tag_parser.set_defaults(func=cmd_by_tag)
 
+    # creds command - dedicated credential listing
+    creds_parser = subparsers.add_parser('creds', help='List/search credentials')
+    creds_parser.add_argument('project', nargs='?', help='Filter by project name')
+    creds_parser.set_defaults(func=cmd_creds)
+
+    # migrate-creds command - tag existing credentials
+    migrate_creds_parser = subparsers.add_parser('migrate-creds', help='Tag credentials missing credentials tag')
+    migrate_creds_parser.add_argument('--dry-run', '-n', action='store_true', help='Show what would be tagged')
+    migrate_creds_parser.add_argument('--apply', action='store_true', help='Actually add the tags')
+    migrate_creds_parser.set_defaults(func=cmd_migrate_creds)
+
     # delete command
     delete_parser = subparsers.add_parser('delete', help='Delete a memory')
     delete_parser.add_argument('id', help='Memory ID to delete')
     delete_parser.set_defaults(func=cmd_delete)
+
+
+    # retag command - update memory tags
+    retag_parser = subparsers.add_parser('retag', help='Update/replace tags on a memory')
+    retag_parser.add_argument('id', help='Memory ID (prefix OK)')
+    retag_parser.add_argument('tags', nargs='?', help='New tags (comma-separated) - replaces all tags')
+    retag_parser.add_argument('--add', '-a', help='Add a single tag (keeps existing)')
+    retag_parser.add_argument('--remove', '-r', help='Remove a single tag')
+    retag_parser.set_defaults(func=cmd_retag)
 
     # show command - display memory details and edges
     show_parser = subparsers.add_parser('show', help='Show memory details and edges')
@@ -1581,6 +1778,11 @@ def main():
     projects_parser.add_argument('--date', help='Show projects on exact DATE')
     projects_parser.add_argument('--verbose', '-v', action='store_true', help='Show memory snippets')
     projects_parser.set_defaults(func=cmd_projects)
+
+    # context command - show project infrastructure
+    context_parser = subparsers.add_parser('context', help='Show all paths/credentials/URLs for a project')
+    context_parser.add_argument('project', nargs='?', help='Project name (default: current directory)')
+    context_parser.set_defaults(func=cmd_context)
 
     # categorize command (for bash script)
     cat_parser = subparsers.add_parser('categorize', help='Auto-categorize content')
@@ -1616,11 +1818,11 @@ def main():
 
     # link command - create edge between two memories
     link_cmd = subparsers.add_parser('link', help='Create edge between two memories')
-    link_cmd.add_argument('from_id', help='Source memory ID (prefix OK)')
-    link_cmd.add_argument('to_id', help='Target memory ID (prefix OK)')
-    link_cmd.add_argument('--relationship', '-r', default='related',
-                          choices=['related', 'supersedes', 'implies', 'contradicts', 'leads_to', 'supports'],
-                          help='Relationship type (default: related)')
+    link_cmd.add_argument('from_id', help='Source memory ID (for solves: solution_id)')
+    link_cmd.add_argument('to_id', help='Target memory ID (for solves: problem_id)')
+    link_cmd.add_argument('--type', '-t', '--relationship', '-r', dest='relationship', default='related',
+                          choices=['related', 'supersedes', 'implies', 'contradicts', 'leads_to', 'supports', 'solves', 'solved_by'],
+                          help='Edge type (default: related). solves: from=solution, to=problem. solved_by: from=problem, to=solution')
     link_cmd.add_argument('--strength', '-s', type=int, default=5, help='Edge strength 1-10')
     link_cmd.set_defaults(func=cmd_link)
 
@@ -1648,6 +1850,20 @@ def main():
     migrate_parser.add_argument('--apply', '-a', action='store_true', help='Actually apply the migration (default: dry run)')
     migrate_parser.add_argument('--verbose', '-v', action='store_true', help='Show each migration')
     migrate_parser.set_defaults(func=cmd_migrate)
+
+    # graph-build command - build project graph from tags
+    graph_build_parser = subparsers.add_parser('graph-build', help='Build project graph from existing memory tags')
+    graph_build_parser.set_defaults(func=cmd_graph_build)
+
+    # graph-show command - show memories linked via graph
+    graph_show_parser = subparsers.add_parser('graph-show', help='Show memories linked to project via graph')
+    graph_show_parser.add_argument('project', help='Project name to query')
+    graph_show_parser.set_defaults(func=cmd_graph_show)
+
+    # graph-clean command - clean orphaned contexts
+    graph_clean_parser = subparsers.add_parser('graph-clean', help='Clean orphaned context nodes')
+    graph_clean_parser.add_argument('--apply', '-a', action='store_true', help='Actually delete (default: dry run)')
+    graph_clean_parser.set_defaults(func=cmd_graph_clean)
 
     args = parser.parse_args()
 
