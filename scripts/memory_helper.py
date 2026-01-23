@@ -28,6 +28,7 @@ from hooks.common import (
     store_memory_embedding,
     contextual_search,
     detect_environment_from_path,
+    detect_project,
     link_memory_to_environment,
     build_project_graph_from_tags,
     get_project_memories_via_graph,
@@ -92,12 +93,18 @@ def cmd_store(args):
         print("ERROR: Failed to store memory", file=sys.stderr)
         sys.exit(1)
 
+def _search_by_tag(tag: str, all_memories: list) -> list:
+    """Search memories by tag (case-insensitive partial match)."""
+    tag_lower = tag.lower()
+    return [m for m in all_memories if tag_lower in m.get('tags', '').lower()]
+
+
 @requires_helix
 def cmd_search(args):
-    """Search memories using vector/semantic search + text matching."""
+    """Search memories using project-first approach with hybrid fallback."""
     query_lower = args.query.lower()
 
-    # Credential-related keywords that trigger tag-first search
+    # Keywords that trigger specialized search modes
     CREDENTIAL_KEYWORDS = {
         'credential', 'credentials', 'password', 'passwords', 'login', 'logins',
         'secret', 'secrets', 'token', 'tokens', 'api key', 'api keys', 'apikey',
@@ -105,94 +112,158 @@ def cmd_search(args):
         'access key', 'ssh key', 'private key', 'api_key'
     }
 
-    # Check if query contains credential keywords
+    DEPLOY_KEYWORDS = {
+        'deploy', 'deployment', 'rsync', 'ssh', 'staging', 'production', 'live',
+        'publish', 'release', 'push', 'upload', 'sync', 'remote', 'server'
+    }
+
     is_credential_query = any(kw in query_lower for kw in CREDENTIAL_KEYWORDS)
+    is_deploy_query = any(kw in query_lower for kw in DEPLOY_KEYWORDS)
 
     matches = []
-    total_matches = 0  # Track total before limiting
+    total_matches = 0
     search_type = ""
 
-    # Detect current project from cwd for context boosting
-    cwd = os.getcwd()
-    project = os.path.basename(cwd).lower()
+    # Get all memories once for reuse
+    all_memories = get_all_memories()
 
-    if is_credential_query:
-        # CREDENTIAL SEARCH: Tag-first approach
-        all_memories = get_all_memories()
+    # ===== PROJECT DETECTION =====
+    # Use detect_project() which checks CWD against p --list paths
+    cwd = os.getcwd()
+    project = detect_project(cwd)
+
+    # ===== SEARCH STRATEGY =====
+    # 1. If project detected → TRY TAG SEARCH FIRST
+    # 2. Credential query → Tag search for 'credentials' tag
+    # 3. Deploy query → Boost deploy-related memories
+    # 4. Fallback → Hybrid search
+    # 5. Auto-fallback to tag search if < 3 results
+
+    tag_search_attempted = False
+
+    # --- Strategy 1: Project tag search (FIRST PRIORITY) ---
+    if project and not is_credential_query:
+        tag_matches = _search_by_tag(project, all_memories)
+        tag_search_attempted = True
+
+        if tag_matches:
+            # Score and filter by query relevance
+            query_words = set(w.strip('.,!?;:') for w in query_lower.split() if len(w) > 2)
+            scored = []
+
+            for m in tag_matches:
+                content_lower = m.get('content', '').lower()
+                tags_lower = m.get('tags', '').lower()
+
+                # Base score for project match
+                score = 100
+
+                # Boost for query word matches
+                for word in query_words:
+                    if word in content_lower or word in tags_lower:
+                        score += 20
+
+                # Boost deploy memories on deploy queries
+                if is_deploy_query:
+                    if any(kw in content_lower or kw in tags_lower for kw in DEPLOY_KEYWORDS):
+                        score += 50
+
+                # Boost by importance
+                score += m.get('importance', 0) * 2
+
+                scored.append((score, m))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            total_matches = len(scored)
+            matches = [m for _, m in scored[:args.limit]]
+            search_type = f"tag:{project}"
+
+    # --- Strategy 2: Credential-specific search ---
+    if is_credential_query and not matches:
         tag_matches = [m for m in all_memories if 'credentials' in m.get('tags', '').lower()]
         content_matches = [m for m in all_memories
                           if any(kw in m.get('content', '').lower() for kw in CREDENTIAL_KEYWORDS)
                           and m not in tag_matches]
 
-        # Extract context terms (exclude credential keywords from boosting)
-        project_terms = [t.strip() for t in query_lower.split()
-                         if len(t) > 2 and t not in CREDENTIAL_KEYWORDS]
-
-        # Combine and score results
+        # Score by project relevance
         seen_ids = set()
-        scored_matches = []
+        scored = []
 
-        for m in tag_matches:
+        for m in tag_matches + content_matches:
             mid = m.get('id')
             if mid in seen_ids:
                 continue
             seen_ids.add(mid)
-            score = 100  # Base score for tag match
+
             content_lower = m.get('content', '').lower()
             tags_lower = m.get('tags', '').lower()
 
-            # Boost if matches project context
+            score = 100 if m in tag_matches else 50
+
+            # Boost by project match
             if project and (project in content_lower or project in tags_lower):
-                score += 50
-            for term in project_terms:
-                if term in content_lower or term in tags_lower:
-                    score += 10
-            scored_matches.append((score, m))
+                score += 80
 
-        for m in content_matches:
-            mid = m.get('id')
-            if mid in seen_ids:
-                continue
-            seen_ids.add(mid)
-            score = 50  # Lower base score for content match
-            content_lower = m.get('content', '').lower()
-            tags_lower = m.get('tags', '').lower()
+            scored.append((score, m))
 
-            if project and (project in content_lower or project in tags_lower):
-                score += 50
-            for term in project_terms:
-                if term in content_lower or term in tags_lower:
-                    score += 10
-            scored_matches.append((score, m))
-
-        scored_matches.sort(key=lambda x: x[0], reverse=True)
-        total_matches = len(scored_matches)
-        matches = [m for _, m in scored_matches[:args.limit]]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        total_matches = len(scored)
+        matches = [m for _, m in scored[:args.limit]]
         search_type = "credential-tag"
 
-        if not matches:
-            matches = hybrid_search(args.query, k=args.limit, window="full")
-            total_matches = len(matches)
-            search_type = "hybrid (fallback)"
-
-    elif args.contextual:
+    # --- Strategy 3: Contextual search if requested ---
+    if args.contextual and not matches:
         matches = contextual_search(args.query, k=args.limit, cwd=cwd)
         total_matches = len(matches)
         search_type = "contextual"
-    else:
-        # Get more than limit to know total available
+
+    # --- Strategy 4: Hybrid search fallback ---
+    if not matches:
         all_results = hybrid_search(args.query, k=50, window="full")
+
+        # Boost deploy memories if deploy query
+        if is_deploy_query and all_results:
+            scored = []
+            for m in all_results:
+                content_lower = m.get('content', '').lower()
+                tags_lower = m.get('tags', '').lower()
+                score = 10  # Base
+                if any(kw in content_lower or kw in tags_lower for kw in DEPLOY_KEYWORDS):
+                    score += 50
+                if project and (project in content_lower or project in tags_lower):
+                    score += 30
+                scored.append((score, m))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            all_results = [m for _, m in scored]
+
         total_matches = len(all_results)
         matches = all_results[:args.limit]
         search_type = "hybrid"
 
+    # --- Auto-fallback: Tag search if < 3 results and project available ---
+    if len(matches) < 3 and project and not tag_search_attempted:
+        tag_matches = _search_by_tag(project, all_memories)
+        if tag_matches and len(tag_matches) > len(matches):
+            # Merge: keep existing matches, add tag matches
+            existing_ids = {m.get('id') for m in matches}
+            for tm in tag_matches:
+                if tm.get('id') not in existing_ids:
+                    matches.append(tm)
+                    if len(matches) >= args.limit:
+                        break
+            total_matches = max(total_matches, len(tag_matches))
+            search_type = f"{search_type}+tag:{project}"
+
+    # ===== OUTPUT =====
     if not matches:
         print("No memories found matching query")
+        if project:
+            print(f"💡 Try: memory tag {project} -n 20")
         return
 
-    # Show context info if project detected and boosting applied
-    if project and project not in ['tools', 'users', 'cminds', 'home']:
-        print(f"📍 Context: {project} (boosting matches)")
+    # Show context info only if tag search was used
+    if project and 'tag:' in search_type:
+        print(f"📍 Project: {project}")
 
     # Hint for verbose credential queries
     if is_credential_query and len(query_lower.split()) > 2:
@@ -281,22 +352,44 @@ def cmd_list(args):
 
 @requires_helix
 def cmd_by_tag(args):
-    """Get memories by tag."""
+    """Get memories by tag (project recall)."""
     memories = get_all_memories()
     tag = args.tag.lower()
 
     matches = [m for m in memories if tag in m.get('tags', '').lower()]
 
+    # Sort by importance (highest first)
+    matches.sort(key=lambda m: -m.get('importance', 0))
+
     if not matches:
         print(f"No memories found with tag: {args.tag}")
         return
 
-    print(f"Found {len(matches)} memory(ies) with tag '{args.tag}':\n")
+    # Apply limit
+    limit = getattr(args, 'limit', None)
+    total = len(matches)
+    if limit:
+        matches = matches[:limit]
+
+    print(f"Found {total} memory(ies) with tag '{tag}'")
+    if limit and total > limit:
+        print(f"Showing top {limit} by importance:\n")
+    else:
+        print()
+
     for m in matches:
         importance = m.get('importance', '?')
         category = m.get('category', 'unknown').upper()
-        content = m.get('content', '')[:80]
-        print(f"[{category} - {importance}] {content}...\n")
+        content = m.get('content', '')
+        tags = m.get('tags', '')
+        mid = m.get('id', '')[:8]
+
+        # Show more content if -f/--full flag present
+        if not getattr(args, 'full', False):
+            content = content[:100] + ('...' if len(content) > 100 else '')
+
+        print(f"[{category} - {importance}] {content}")
+        print(f"  Tags: {tags}  ID: {mid}\n")
 
 @requires_helix
 def cmd_creds(args):
@@ -1733,10 +1826,19 @@ def main():
     list_parser.add_argument('--date', help='Show memories created on exact date (2026-01-10)')
     list_parser.set_defaults(func=cmd_list)
 
-    # by-tag command
+    # by-tag command (also aliased as 'tag')
     tag_parser = subparsers.add_parser('by-tag', help='Get memories by tag')
-    tag_parser.add_argument('tag', help='Tag to search for')
+    tag_parser.add_argument('tag', help='Tag to search for (supports domain normalization)')
+    tag_parser.add_argument('--limit', '-n', type=int, help='Limit results')
+    tag_parser.add_argument('--full', '-f', action='store_true', help='Show full content')
     tag_parser.set_defaults(func=cmd_by_tag)
+
+    # tag command (alias for by-tag - more convenient)
+    tag_alias = subparsers.add_parser('tag', help='Get memories by project tag (alias for by-tag)')
+    tag_alias.add_argument('tag', help='Tag/project name (e.g., supply-family or staging.supply.family)')
+    tag_alias.add_argument('--limit', '-n', type=int, help='Limit results')
+    tag_alias.add_argument('--full', '-f', action='store_true', help='Show full content')
+    tag_alias.set_defaults(func=cmd_by_tag)
 
     # creds command - dedicated credential listing
     creds_parser = subparsers.add_parser('creds', help='List/search credentials')

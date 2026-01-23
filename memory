@@ -213,19 +213,30 @@ case "$1" in
         fi
 
         # Auto-categorize if no explicit flags provided
+        # Preserve user-provided tags to merge with auto-generated ones
+        user_tags="$tags"
         if $auto_categorize; then
             echo "Analyzing memory..."
             json=$(python3 "$HELPER" categorize "$content" 2>/dev/null)
             if [ -n "$json" ] && command -v jq >/dev/null; then
                 category=$(echo "$json" | jq -r '.category // "fact"')
                 importance=$(echo "$json" | jq -r '.importance // 5')
-                tags=$(echo "$json" | jq -r '.tags // ""')
+                auto_tags=$(echo "$json" | jq -r '.tags // ""')
             elif [ -n "$json" ]; then
                 category=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('category','fact'))" 2>/dev/null || echo "fact")
                 importance=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('importance',5))" 2>/dev/null || echo "5")
-                tags=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tags',''))" 2>/dev/null || echo "")
+                auto_tags=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tags',''))" 2>/dev/null || echo "")
             else
-                category="fact"; importance=5; tags=""
+                category="fact"; importance=5; auto_tags=""
+            fi
+            # Merge user-provided tags with auto-generated tags (deduped)
+            if [ -n "$user_tags" ] && [ -n "$auto_tags" ]; then
+                # Combine and dedupe tags
+                tags=$(echo "$user_tags,$auto_tags" | tr ',' '\n' | awk '!seen[$0]++' | tr '\n' ',' | sed 's/,$//')
+            elif [ -n "$user_tags" ]; then
+                tags="$user_tags"
+            else
+                tags="$auto_tags"
             fi
         fi
 
