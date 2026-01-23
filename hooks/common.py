@@ -760,6 +760,20 @@ def store_memory(content: str, category: str, importance: int, tags: str, source
             except Exception as e:
                 print(f"WARNING: Auto-linking failed: {e}", file=sys.stderr)
 
+        # Auto-link to project graph when tagged with a known project
+        if memory_id and tags:
+            try:
+                known_projects = set(get_known_projects().values())
+                if known_projects:
+                    tag_list = [t.strip().lower() for t in tags.split(',') if t.strip()]
+                    for tag in tag_list:
+                        if tag in known_projects:
+                            if link_memory_to_project(memory_id, tag):
+                                print(f"INFO: Auto-linked memory to project: {tag}", file=sys.stderr)
+                            break  # Only link to first matching project
+            except Exception as e:
+                print(f"WARNING: Auto-link to project failed: {e}", file=sys.stderr)
+
         return memory_id
     except Exception as e:
         print(f"ERROR: Failed to store memory: {e}", file=sys.stderr)
