@@ -64,6 +64,41 @@ helix_running() {
     curl -s --connect-timeout 2 "$HELIX_URL/GetAllMemories" -X POST -H "Content-Type: application/json" -d '{}' &>/dev/null
 }
 
+# Detect project from working directory (mirrors Python detect_project logic)
+detect_project() {
+    local cwd="${1:-$(pwd)}"
+    cwd="${cwd%/}"  # Remove trailing slash
+
+    # Skip directories that aren't meaningful project names
+    local skip_dirs="wordpress wp-content plugins themes Sites Tools Projects PycharmProjects Documents Praca Users cminds hooks src lib node_modules .wp-test sites Fiverr _WLASNE_"
+
+    # Walk path from end, find first meaningful directory
+    local IFS='/'
+    local parts=($cwd)
+    local i=${#parts[@]}
+    while [ $i -gt 0 ]; do
+        i=$((i - 1))
+        local part="${parts[$i]}"
+        # Skip empty, short, or excluded dirs
+        if [ -z "$part" ] || [ ${#part} -le 2 ]; then
+            continue
+        fi
+        local skip=false
+        for skip_dir in $skip_dirs; do
+            if [ "$part" = "$skip_dir" ]; then
+                skip=true
+                break
+            fi
+        done
+        if ! $skip; then
+            # Clean and normalize
+            echo "$part" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | sed 's/\.local$//; s/\.loc$//'
+            return
+        fi
+    done
+    echo ""
+}
+
 case "$1" in
     start)
         if helix_running; then
@@ -237,6 +272,16 @@ case "$1" in
                 tags="$user_tags"
             else
                 tags="$auto_tags"
+            fi
+        fi
+
+        # Auto-add project tag from working directory
+        project=$(detect_project)
+        if [ -n "$project" ]; then
+            if [ -z "$tags" ]; then
+                tags="$project"
+            elif ! echo ",$tags," | grep -qi ",$project,"; then
+                tags="$tags,$project"
             fi
         fi
 
