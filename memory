@@ -390,6 +390,26 @@ case "$1" in
                 ;;
         esac
         ;;
+    watchdog|wd)
+        shift
+        WATCHDOG="$SCRIPT_DIR/scripts/watchdog.py"
+        case "$1" in
+            start|daemon|stop|status|logs)
+                python3 "$WATCHDOG" "$@"
+                ;;
+            "")
+                python3 "$WATCHDOG" status
+                ;;
+            *)
+                echo "Usage: memory watchdog <command>"
+                echo "  status    Show watchdog and HelixDB status"
+                echo "  daemon    Start watchdog as background process"
+                echo "  stop      Stop watchdog daemon"
+                echo "  start     Run watchdog in foreground"
+                echo "  logs      Show recent crash logs"
+                ;;
+        esac
+        ;;
     help|--help|-h)
         cat << 'EOF'
 Helix Memory CLI
@@ -401,6 +421,7 @@ Service Commands:
   stop                    Stop HelixDB
   restart                 Restart HelixDB
   status, st              Check HelixDB status and memory count
+  watchdog, wd            Manage auto-restart watchdog
 
 Memory Commands:
   search, s <query>       Search memories by content
@@ -438,6 +459,15 @@ Graph Commands:
   graph build             Build project graph from existing memory tags
   graph <project>         Show memories linked to project via graph traversal
 
+Watchdog Commands:
+  watchdog status         Show watchdog and HelixDB status
+  watchdog daemon         Start auto-restart watchdog (background)
+  watchdog stop           Stop watchdog daemon
+  watchdog logs           Show recent crash logs
+
+Report Bugs:
+  msg helix-memory 'bug: <description>'
+
 Examples:
   memory creds            # List ALL credentials
   memory creds wp-test    # Show only wp-test credentials
@@ -449,6 +479,8 @@ Examples:
   memory health -v        # Detailed health report
   memory graph build      # Create project contexts from tags
   memory graph wp-test    # Show wp-test memories via graph
+  memory watchdog daemon  # Enable auto-restart on crash
+  memory watchdog logs    # View crash history
 
 Categories: preference, fact, context, decision, task, solution
 EOF

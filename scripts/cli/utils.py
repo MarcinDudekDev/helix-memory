@@ -17,7 +17,22 @@ def requires_helix(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         if not check_helix_running():
-            print("ERROR: HelixDB not running", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print("ERROR: HelixDB is not running", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
+            print("", file=sys.stderr)
+            print("To restart HelixDB:", file=sys.stderr)
+            print("  memory start", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("If it keeps crashing, check crash logs:", file=sys.stderr)
+            print("  memory watchdog logs", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("To enable auto-restart watchdog:", file=sys.stderr)
+            print("  memory watchdog daemon", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("To report a bug:", file=sys.stderr)
+            print("  msg helix-memory 'bug: <describe the issue>'", file=sys.stderr)
+            print("", file=sys.stderr)
             sys.exit(1)
         return func(*args, **kwargs)
     return wrapper
